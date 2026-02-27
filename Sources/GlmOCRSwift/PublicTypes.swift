@@ -11,11 +11,11 @@ public struct GlmOCRRecognitionOptions: Sendable, Codable, Equatable {
 
     public init(
         maxTokens: Int = 4_096,
-        temperature: Float = 0,
+        temperature: Float = 0.8,
         prefillStepSize: Int = 2_048,
-        topP: Float = 1,
-        topK: Int = 1,
-        repetitionPenalty: Float = 1
+        topP: Float = 0.9,
+        topK: Int = 50,
+        repetitionPenalty: Float = 1.1
     ) {
         self.maxTokens = maxTokens
         self.temperature = temperature
@@ -295,7 +295,7 @@ public struct GlmOCRLayoutConfig: Sendable, Codable, Equatable {
             "vision_footnote", "seal", "formula_number"
         ],
         "table": ["table"],
-        "formula": ["formula", "display_formula", "inline_formula"],
+        "formula": ["display_formula", "inline_formula"],
         "skip": ["chart", "image"],
         "abandon": [
             "header", "footer", "number", "footnote", "aside_text", "reference",
@@ -333,7 +333,7 @@ public struct GlmOCRConfig: Sendable, Codable, Equatable {
     public init(
         recognizerModelID: String = "mlx-community/GLM-OCR-bf16",
         layoutModelID: String = "PaddlePaddle/PP-DocLayoutV3_safetensors",
-        maxConcurrentRecognitions: Int = 2,
+        maxConcurrentRecognitions: Int = 1,
         enableLayout: Bool = true,
         recognitionOptions: GlmOCRRecognitionOptions = .init(),
         prompts: GlmOCRPromptConfig = .init(),
@@ -436,6 +436,21 @@ public struct ParseOptions: Sendable, Codable, Equatable {
         if let maxPages, maxPages <= 0 {
             throw GlmOCRError.invalidConfiguration("maxPages must be greater than zero when provided")
         }
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case includeMarkdown
+        case includeDiagnostics
+        case maxPages
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let defaults = Self()
+        self.includeMarkdown = try container.decodeIfPresent(Bool.self, forKey: .includeMarkdown) ?? defaults.includeMarkdown
+        self.includeDiagnostics = try container.decodeIfPresent(Bool.self, forKey: .includeDiagnostics)
+            ?? defaults.includeDiagnostics
+        self.maxPages = try container.decodeIfPresent(Int.self, forKey: .maxPages)
     }
 }
 

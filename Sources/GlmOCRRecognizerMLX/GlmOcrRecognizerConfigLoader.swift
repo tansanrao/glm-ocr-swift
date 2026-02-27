@@ -122,7 +122,7 @@ public enum GlmOcrRecognizerConfigLoader {
 
     private static func materializeProcessorConfig(from raw: RawImageProcessor) -> GlmOcrProcessorConfig {
         let minPixels = raw.minPixels ?? raw.size?.shortestEdge ?? 112 * 112
-        let maxPixels = raw.maxPixels ?? raw.size?.longestEdge ?? (14 * 14 * 4 * 15_000)
+        let maxPixels = raw.maxPixels ?? raw.size?.longestEdge ?? (14 * 14 * 4 * 1_280)
 
         return GlmOcrProcessorConfig(
             imageMean: raw.imageMean ?? [0.48145466, 0.4578275, 0.40821073],

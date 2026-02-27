@@ -98,7 +98,8 @@ let package = Package(
         .testTarget(
             name: "GlmOCRTests",
             dependencies: [
-                "GlmOCRSwift"
+                "GlmOCRSwift",
+                "GlmOCRRecognizerMLX"
             ],
             swiftSettings: strictConcurrency
         )

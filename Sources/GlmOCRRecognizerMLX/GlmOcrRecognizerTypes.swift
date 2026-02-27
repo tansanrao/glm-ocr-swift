@@ -96,12 +96,12 @@ public struct GlmOcrGenerationOptions: Sendable, Equatable {
     public static func fromEnvironment(_ environment: [String: String] = ProcessInfo.processInfo.environment)
         -> GlmOcrGenerationOptions
     {
-        let maxTokens = Int(environment["GLMOCR_MAX_TOKENS"] ?? "") ?? 512
-        let temperature = Float(environment["GLMOCR_TEMPERATURE"] ?? "") ?? 0
+        let maxTokens = Int(environment["GLMOCR_MAX_TOKENS"] ?? "") ?? 4_096
+        let temperature = Float(environment["GLMOCR_TEMPERATURE"] ?? "") ?? 0.8
         let prefillStepSize = Int(environment["GLMOCR_PREFILL_STEP_SIZE"] ?? "") ?? 2_048
-        let topP = Float(environment["GLMOCR_TOP_P"] ?? "") ?? 1
-        let topK = Int(environment["GLMOCR_TOP_K"] ?? "") ?? 1
-        let repetitionPenalty = Float(environment["GLMOCR_REPETITION_PENALTY"] ?? "") ?? 1
+        let topP = Float(environment["GLMOCR_TOP_P"] ?? "") ?? 0.9
+        let topK = Int(environment["GLMOCR_TOP_K"] ?? "") ?? 50
+        let repetitionPenalty = Float(environment["GLMOCR_REPETITION_PENALTY"] ?? "") ?? 1.1
 
         return GlmOcrGenerationOptions(
             maxTokens: max(1, maxTokens),

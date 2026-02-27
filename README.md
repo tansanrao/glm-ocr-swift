@@ -83,20 +83,22 @@ PDF page limits are resolved as:
 
 - `recognizerModelID`: `mlx-community/GLM-OCR-bf16`
 - `layoutModelID`: `PaddlePaddle/PP-DocLayoutV3_safetensors`
-- `maxConcurrentRecognitions`: `2`
+- `maxConcurrentRecognitions`: `1`
 - `enableLayout`: `true`
 - `pdfDPI`: `200`
 - `pdfMaxRenderedLongSide`: `3500`
 - `defaultMaxPages`: `nil`
 
+`maxConcurrentRecognitions` is intentionally capped at `1` to process one page/recognition job at a time by default.
+
 `GlmOCRRecognitionOptions` defaults:
 
 - `maxTokens`: `4096`
-- `temperature`: `0`
+- `temperature`: `0.8`
 - `prefillStepSize`: `2048`
-- `topP`: `1`
-- `topK`: `1`
-- `repetitionPenalty`: `1`
+- `topP`: `0.9`
+- `topK`: `50`
+- `repetitionPenalty`: `1.1`
 
 `ParseOptions` defaults:
 

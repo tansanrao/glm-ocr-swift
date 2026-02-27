@@ -68,7 +68,7 @@ internal enum PPDocLayoutMLXContract {
             "vision_footnote", "seal", "formula_number"
         ],
         "table": ["table"],
-        "formula": ["formula", "display_formula", "inline_formula"],
+        "formula": ["display_formula", "inline_formula"],
         "skip": ["chart", "image"],
         "abandon": [
             "header", "footer", "number", "footnote", "aside_text", "reference",
