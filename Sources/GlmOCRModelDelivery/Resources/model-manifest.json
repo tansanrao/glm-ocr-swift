@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "models": [
+    {
+      "modelID": "mlx-community/GLM-OCR-bf16",
+      "repoKind": "model",
+      "revision": "24f15402e83baa0a80eeeaecf5480e172abc6f2e",
+      "downloadGlobs": [
+        "*.json",
+        "*.safetensors",
+        "*.txt",
+        "*.model",
+        "*.tiktoken",
+        "*.jinja"
+      ],
+      "requiredFiles": [
+        "config.json"
+      ],
+      "requireAnySafetensors": true
+    },
+    {
+      "modelID": "PaddlePaddle/PP-DocLayoutV3_safetensors",
+      "repoKind": "model",
+      "revision": "a0abee1e2bb505e5662993235af873a5d89851e3",
+      "downloadGlobs": [
+        "*.json",
+        "*.safetensors"
+      ],
+      "requiredFiles": [
+        "config.json"
+      ],
+      "requireAnySafetensors": true
+    }
+  ]
+}
