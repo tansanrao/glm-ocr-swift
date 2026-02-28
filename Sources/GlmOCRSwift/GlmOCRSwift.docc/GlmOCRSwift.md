@@ -15,6 +15,7 @@ Execution is local:
 - optional layout stage: `PP-DocLayoutV3` MLX backend
 - recognition stage: `GLM-OCR` MLX backend
 - formatting: region/page output + markdown
+- optional markdown bundle: rewritten markdown + JSON sidecar + HEIC figures
 - diagnostics: timings, metadata, warnings
 
 Page cap behavior:
@@ -36,6 +37,8 @@ Page cap behavior:
 - ``GlmOCRRecognitionOptions``
 - ``GlmOCRPromptConfig``
 - ``GlmOCRLayoutConfig``
+- ``GlmOCRMarkdownBundleConfig``
+- ``GlmOCRFigureFormat``
 
 ### Input and output
 
@@ -43,6 +46,8 @@ Page cap behavior:
 - ``LayoutRegion``
 - ``OCRRegion``
 - ``OCRPageResult``
+- ``OCRFigureAsset``
+- ``OCRMarkdownBundle``
 - ``OCRDocumentResult``
 - ``ParseDiagnostics``
 

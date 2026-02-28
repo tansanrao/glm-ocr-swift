@@ -99,13 +99,17 @@ This path skips layout model execution and region cropping.
 
 - `OCRPageResult` per page (`OCRRegion` entries)
 - merged markdown document
+- optional `OCRMarkdownBundle` (in-memory) with:
+  - rewritten markdown image references (`figures/*.heic`)
+  - figure binaries (`OCRFigureAsset.data`)
+  - JSON sidecar (`documentJSON`) including pages/diagnostics/figure manifest
 
 Formatting includes:
 
 - heading normalization (`doc_title`, `paragraph_title`)
 - formula block normalization and formula-number tag merge
 - text cleanup and bullet normalization
-- optional image placeholders (`![](page=...,bbox=...)`)
+- default image placeholders (`![](page=...,bbox=...)`) that are rewritten when markdown bundle export is enabled
 
 ## Diagnostics and warnings
 

@@ -58,6 +58,7 @@ print(result.diagnostics.timingsMs)
 - `pages`: structured region results per page
 - `markdown`: merged markdown output (if enabled)
 - `diagnostics`: warnings, timings, metadata (if enabled)
+- `markdownBundle`: optional in-memory bundle (`document.md`, `document.json`, `figures/*.heic`)
 
 ## Pipeline behavior
 
@@ -68,6 +69,7 @@ print(result.diagnostics.timingsMs)
   - crop detected regions
   - recognize by task (`text` / `table` / `formula`)
   - post-format into markdown
+  - if `markdownBundle.enabled == true`, build an in-memory markdown bundle and rewrite image markers
 - `enableLayout == false`:
   - run whole-page recognition with `noLayoutPrompt`
 
@@ -85,6 +87,12 @@ PDF page limits are resolved as:
 - `layoutModelID`: `PaddlePaddle/PP-DocLayoutV3_safetensors`
 - `maxConcurrentRecognitions`: `1`
 - `enableLayout`: `true`
+- `markdownBundle.enabled`: `true`
+- `markdownBundle.figureFormat`: `heic`
+- `markdownBundle.markdownFileName`: `document.md`
+- `markdownBundle.jsonFileName`: `document.json`
+- `markdownBundle.figuresDirectoryName`: `figures`
+- `markdownBundle.heicCompressionQuality`: `0.82`
 - `pdfDPI`: `200`
 - `pdfMaxRenderedLongSide`: `3500`
 - `defaultMaxPages`: `nil`
@@ -105,6 +113,22 @@ PDF page limits are resolved as:
 - `includeMarkdown`: `true`
 - `includeDiagnostics`: `true`
 - `maxPages`: `nil`
+
+## Markdown bundle contract
+
+When all of these are true:
+
+- `GlmOCRConfig.enableLayout == true`
+- `GlmOCRConfig.markdownBundle.enabled == true`
+- `ParseOptions.includeMarkdown == true`
+
+the pipeline emits `OCRDocumentResult.markdownBundle`:
+
+- `rewrittenMarkdown`: markdown where figure markers point to `figures/*.heic`
+- `documentJSON`: JSON sidecar with pages, diagnostics, and figure manifest metadata
+- `figures`: HEIC figure binaries + metadata (`relativePath`, `bbox2D`, dimensions, checksum)
+
+The bundle is in-memory so callers can persist it to any filesystem layout.
 
 ## Model delivery and caching
 
