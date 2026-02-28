@@ -12,6 +12,7 @@ public actor GlmOCRPipeline {
     private let regionRecognizer: any RegionRecognizer
     private let regionCropper: any PipelineRegionCropping
     private let formatter: PipelineFormatter
+    private nonisolated static let pipelineTraceEnabled = ProcessInfo.processInfo.environment["GLMOCR_DEBUG_PIPELINE_TRACE"] == "1"
 
     public init(config: GlmOCRConfig) async throws {
         let modelManager: SandboxModelManager
@@ -81,6 +82,9 @@ public actor GlmOCRPipeline {
     }
 
     public func parse(_ input: InputDocument, options: ParseOptions) async throws -> OCRDocumentResult {
+        Self.trace(
+            "parse.start layout=\(config.enableLayout) maxConcurrent=\(config.maxConcurrentRecognitions) maxPagesOption=\(options.maxPages.map(String.init) ?? "nil") defaultMaxPages=\(config.defaultMaxPages.map(String.init) ?? "nil")"
+        )
         try options.validate()
         try Task.checkCancellation()
 
@@ -98,6 +102,10 @@ public actor GlmOCRPipeline {
             maxPages: options.maxPages
         )
         timingsMs["page_load"] = elapsedMilliseconds(since: pageLoadStart)
+        let pageSizeSummary = pages.enumerated().map { index, page in
+            "p\(index + 1)=\(page.width)x\(page.height)"
+        }.joined(separator: ",")
+        Self.trace("parse.pageLoad pages=\(pages.count) sizes=[\(pageSizeSummary)]")
         let pageRenderDebug = dumpPageRenderDiagnosticsIfRequested(
             input: input,
             pages: pages
@@ -109,6 +117,7 @@ public actor GlmOCRPipeline {
 
         let pagesAndMarkdown: (pages: [OCRPageResult], markdown: String)
         if config.enableLayout {
+            Self.trace("parse.layout.detect.start pageCount=\(pages.count)")
             let layoutStart = Date()
             let detailedDetections = try await layoutDetector.detectDetailed(
                 pages: pages,
@@ -118,6 +127,10 @@ public actor GlmOCRPipeline {
             timingsMs["layout_preprocess"] = layoutDuration
             timingsMs["layout_inference"] = layoutDuration
             timingsMs["layout_postprocess"] = layoutDuration
+            let detectionSummary = detailedDetections.enumerated().map { index, regions in
+                "p\(index + 1)=\(regions.count)"
+            }.joined(separator: ",")
+            Self.trace("parse.layout.detect.done pageRegions=[\(detectionSummary)] elapsedMs=\(layoutDuration)")
 
             guard detailedDetections.count == pages.count else {
                 throw GlmOCRError.invalidConfiguration(
@@ -132,18 +145,26 @@ public actor GlmOCRPipeline {
             )
             warnings.append(contentsOf: ocrPreprocessed.warnings)
             timingsMs["ocr_preprocess"] = elapsedMilliseconds(since: ocrPreprocessStart)
+            Self.trace(
+                "parse.ocrPreprocess.done jobs=\(ocrPreprocessed.recognitionJobs.count) warnings=\(ocrPreprocessed.warnings.count)"
+            )
 
             let ocrPreprocessOnly = ProcessInfo.processInfo.environment["GLMOCR_DEBUG_OCR_PREPROCESS_ONLY"] == "1"
             let merged: (pageRegions: [[PipelineRegionRecord]], warnings: [String])
             if ocrPreprocessOnly {
                 timingsMs["ocr_inference"] = 0
                 merged = (ocrPreprocessed.pageRegions, [])
+                Self.trace("parse.ocrInference.skipped preprocessOnly=1")
             } else {
+                Self.trace("parse.ocrInference.start queuedJobs=\(ocrPreprocessed.recognitionJobs.count)")
                 let ocrInferenceStart = Date()
                 let ocrInferred = try await ocrInferenceRecognizeQueuedRegions(
                     jobs: ocrPreprocessed.recognitionJobs
                 )
                 timingsMs["ocr_inference"] = elapsedMilliseconds(since: ocrInferenceStart)
+                Self.trace(
+                    "parse.ocrInference.done results=\(ocrInferred.results.count) elapsedMs=\(timingsMs["ocr_inference"] ?? -1)"
+                )
                 merged = ocrInferenceMergeResults(
                     pageRegions: ocrPreprocessed.pageRegions,
                     inferenceResults: ocrInferred
@@ -155,18 +176,28 @@ public actor GlmOCRPipeline {
             let ocrPostprocessStart = Date()
             pagesAndMarkdown = ocrPostprocessFormatLayout(pageRegions: merged.pageRegions)
             timingsMs["ocr_postprocess"] = elapsedMilliseconds(since: ocrPostprocessStart)
+            Self.trace(
+                "parse.ocrPostprocess.layout.done outputPages=\(pagesAndMarkdown.pages.count) markdownChars=\(pagesAndMarkdown.markdown.count)"
+            )
         } else {
             timingsMs["ocr_preprocess"] = 0
+            Self.trace("parse.noLayout.ocrInference.start pageCount=\(pages.count)")
             let ocrInferenceStart = Date()
             let recognizedContents = try await recognizeWholePages(
                 pages: pages
             )
             warnings.append(contentsOf: recognizedContents.warnings)
             timingsMs["ocr_inference"] = elapsedMilliseconds(since: ocrInferenceStart)
+            Self.trace(
+                "parse.noLayout.ocrInference.done outputs=\(recognizedContents.contents.count) warnings=\(recognizedContents.warnings.count) elapsedMs=\(timingsMs["ocr_inference"] ?? -1)"
+            )
 
             let ocrPostprocessStart = Date()
             pagesAndMarkdown = ocrPostprocessFormatNoLayout(contents: recognizedContents.contents)
             timingsMs["ocr_postprocess"] = elapsedMilliseconds(since: ocrPostprocessStart)
+            Self.trace(
+                "parse.ocrPostprocess.noLayout.done outputPages=\(pagesAndMarkdown.pages.count) markdownChars=\(pagesAndMarkdown.markdown.count)"
+            )
         }
 
         timingsMs["total"] = elapsedMilliseconds(since: totalStart)
@@ -204,6 +235,15 @@ public actor GlmOCRPipeline {
             markdown: options.includeMarkdown ? pagesAndMarkdown.markdown : "",
             diagnostics: diagnostics
         )
+    }
+
+    private nonisolated static func trace(_ message: String) {
+        guard pipelineTraceEnabled else {
+            return
+        }
+        let payload = "[GlmOCRPipeline] \(message)\n"
+        let data = payload.data(using: .utf8) ?? Data()
+        FileHandle.standardError.write(data)
     }
 
     private func recognizeWholePages(

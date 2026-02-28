@@ -392,7 +392,7 @@ private final class GlmOcrVisionAttention: Module {
         outputs.reserveCapacity(qSplits.count)
 
         for index in 0 ..< qSplits.count {
-            let attended = MLXFast.scaledDotProductAttention(
+            let attended = glmOcrScaledDotProductAttention(
                 queries: qSplits[index],
                 keys: kSplits[index],
                 values: vSplits[index],

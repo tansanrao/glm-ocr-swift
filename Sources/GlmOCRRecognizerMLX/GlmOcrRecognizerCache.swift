@@ -96,7 +96,7 @@ internal func glmOcrAttentionWithCacheUpdate(
 ) -> MLXArray {
     if let cache {
         let (cachedKeys, cachedValues) = cache.update(keys: keys, values: values)
-        return MLXFast.scaledDotProductAttention(
+        return glmOcrScaledDotProductAttention(
             queries: queries,
             keys: cachedKeys,
             values: cachedValues,
@@ -105,7 +105,7 @@ internal func glmOcrAttentionWithCacheUpdate(
         )
     }
 
-    return MLXFast.scaledDotProductAttention(
+    return glmOcrScaledDotProductAttention(
         queries: queries,
         keys: keys,
         values: values,

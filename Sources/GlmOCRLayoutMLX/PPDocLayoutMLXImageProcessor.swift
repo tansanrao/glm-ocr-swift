@@ -3,9 +3,12 @@ import Foundation
 import MLX
 
 internal enum PPDocLayoutMLXImageProcessor {
+    private nonisolated static let traceEnabled = ProcessInfo.processInfo.environment["GLMOCR_DEBUG_PIPELINE_TRACE"] == "1"
+
     internal static func pixelValues(from image: CGImage) throws -> MLXArray {
         let width = PPDocLayoutMLXContract.inputShape[3]
         let height = PPDocLayoutMLXContract.inputShape[2]
+        trace("pixelValues.start source=\(image.width)x\(image.height) target=\(width)x\(height)")
 
         var rgba = [UInt8](repeating: 0, count: width * height * 4)
 
@@ -46,11 +49,22 @@ internal enum PPDocLayoutMLXImageProcessor {
             chw[(2 * hw) + offset] = Float(rgba[rgbaOffset + 2]) / 255.0
         }
 
-        return MLXArray(chw).reshaped(
+        let pixelValues = MLXArray(chw).reshaped(
             PPDocLayoutMLXContract.inputShape[0],
             PPDocLayoutMLXContract.inputShape[1],
             PPDocLayoutMLXContract.inputShape[2],
             PPDocLayoutMLXContract.inputShape[3]
         )
+        trace("pixelValues.done shape=\(pixelValues.shape)")
+        return pixelValues
+    }
+
+    private nonisolated static func trace(_ message: String) {
+        guard traceEnabled else {
+            return
+        }
+        let payload = "[PPDocLayoutMLXImageProcessor] \(message)\n"
+        let data = payload.data(using: .utf8) ?? Data()
+        FileHandle.standardError.write(data)
     }
 }

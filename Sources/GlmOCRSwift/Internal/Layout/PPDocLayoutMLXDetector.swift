@@ -3,6 +3,7 @@ import Foundation
 
 internal actor PPDocLayoutMLXDetector: LayoutDetector, PipelineLayoutDetecting {
     private let inferenceClient: any LayoutInferenceClient
+    private nonisolated static let traceEnabled = ProcessInfo.processInfo.environment["GLMOCR_DEBUG_PIPELINE_TRACE"] == "1"
 
     internal init(
         config: GlmOCRConfig,
@@ -42,11 +43,23 @@ internal actor PPDocLayoutMLXDetector: LayoutDetector, PipelineLayoutDetecting {
         var pageRegions: [[PipelineLayoutRegion]] = []
         pageRegions.reserveCapacity(pages.count)
 
-        for page in pages {
+        for (pageIndex, page) in pages.enumerated() {
             try Task.checkCancellation()
-            pageRegions.append(try await inferenceClient.detectLayout(image: page))
+            Self.trace("detectDetailed.page.start index=\(pageIndex) size=\(page.width)x\(page.height)")
+            let regions = try await inferenceClient.detectLayout(image: page)
+            Self.trace("detectDetailed.page.done index=\(pageIndex) regions=\(regions.count)")
+            pageRegions.append(regions)
         }
 
         return pageRegions
+    }
+
+    private nonisolated static func trace(_ message: String) {
+        guard traceEnabled else {
+            return
+        }
+        let payload = "[PPDocLayoutMLXDetector] \(message)\n"
+        let data = payload.data(using: .utf8) ?? Data()
+        FileHandle.standardError.write(data)
     }
 }

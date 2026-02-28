@@ -7,6 +7,7 @@ internal struct GlmOcrRecognizerProcessor: Sendable {
     private let tokenizer: any Tokenizer
     private let modelConfig: GlmOcrModelConfig
     private let processorConfig: GlmOcrProcessorConfig
+    private let traceEnabled = ProcessInfo.processInfo.environment["GLMOCR_DEBUG_PIPELINE_TRACE"] == "1"
 
     internal init(
         tokenizer: any Tokenizer,
@@ -19,6 +20,7 @@ internal struct GlmOcrRecognizerProcessor: Sendable {
     }
 
     internal func prepare(prompt: String, image: CGImage) throws -> GlmOcrPreparedInput {
+        trace("prepare.start source=\(image.width)x\(image.height) promptChars=\(prompt.count)")
         let templatedTokens = try chatTemplateTokens(prompt: prompt)
 
         let target = try GlmOcrRecognizerImageProcessor.smartResize(
@@ -31,6 +33,7 @@ internal struct GlmOcrRecognizerProcessor: Sendable {
             minPixels: processorConfig.minPixels,
             maxPixels: processorConfig.maxPixels
         )
+        trace("prepare.resize target=\(target.width)x\(target.height)")
 
         let pixels = try GlmOcrRecognizerImageProcessor.normalizedPixelValues(
             from: image,
@@ -46,6 +49,7 @@ internal struct GlmOcrRecognizerProcessor: Sendable {
             patchSize: processorConfig.patchSize,
             temporalPatchSize: processorConfig.temporalPatchSize
         )
+        trace("prepare.patchify grid=[\(patchified.gridTHW.t),\(patchified.gridTHW.h),\(patchified.gridTHW.w)] pixelValuesShape=\(pixels.shape)")
 
         let mergeArea = processorConfig.mergeSize * processorConfig.mergeSize
         let imageTokenCount = max(1, patchified.gridTHW.product / mergeArea)
@@ -58,6 +62,7 @@ internal struct GlmOcrRecognizerProcessor: Sendable {
         )
 
         let attentionMask = Array(repeating: 1, count: inputIDs.count)
+        trace("prepare.done inputTokens=\(inputIDs.count) imageTokenCount=\(imageTokenCount)")
 
         return GlmOcrPreparedInput(
             inputIDs: inputIDs,
@@ -114,5 +119,14 @@ internal struct GlmOcrRecognizerProcessor: Sendable {
         }
 
         return output
+    }
+
+    private func trace(_ message: String) {
+        guard traceEnabled else {
+            return
+        }
+        let payload = "[GlmOcrRecognizerProcessor] \(message)\n"
+        let data = payload.data(using: .utf8) ?? Data()
+        FileHandle.standardError.write(data)
     }
 }

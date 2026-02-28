@@ -148,6 +148,11 @@ Generation defaults from env (low-level recognizer runtime):
 - `GLMOCR_TOP_K`
 - `GLMOCR_REPETITION_PENALTY`
 
+Attention backend override (advanced/debug):
+
+- `GLMOCR_FORCE_FAST_SDPA=1`: force MLX fast SDPA kernels even when Metal API validation is enabled
+- By default, when `MTL_DEBUG_LAYER=1` or `METAL_DEVICE_WRAPPER_TYPE=1`, recognizer attention uses a validation-safe fallback path
+
 ## Documentation
 
 - [DocC index](Sources/GlmOCRSwift/GlmOCRSwift.docc/GlmOCRSwift.md)

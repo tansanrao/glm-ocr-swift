@@ -256,8 +256,10 @@ public actor GlmOcrRecognizerRuntime {
                     inputEmbeddings: chunkEmbeddings,
                     attentionMask: attentionMask,
                     cache: cache,
-                    pixelValues: pixelValues,
-                    imageGridTHW: imageGridTHW
+                    // Vision inputs are already merged into `chunkEmbeddings`.
+                    // Passing them again resets multimodal rope state and can corrupt decode caches.
+                    pixelValues: nil,
+                    imageGridTHW: nil
                 )
                 eval(chunkLogits)
                 trace("generate.prefill chunk complete")

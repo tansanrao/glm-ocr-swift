@@ -8,6 +8,7 @@ package actor PPDocLayoutMLXRunner {
     private let weightsLoader: PPDocLayoutMLXWeightsLoader
 
     private var modelTask: Task<PPDocLayoutModel, Error>?
+    private nonisolated static let traceEnabled = ProcessInfo.processInfo.environment["GLMOCR_DEBUG_PIPELINE_TRACE"] == "1"
 
     package init(
         modelID: String,
@@ -20,27 +21,38 @@ package actor PPDocLayoutMLXRunner {
 
     internal func forward(image: CGImage) async throws -> PPDocLayoutMLXPrediction {
         try Task.checkCancellation()
+        Self.trace("forward.start image=\(image.width)x\(image.height)")
         let pixelValues = try layoutPreprocess(image: image)
+        Self.trace("forward.preprocess shape=\(pixelValues.shape)")
         let model = try await loadedModel()
-        return try layoutInference(pixelValues: pixelValues, model: model)
+        let prediction = try layoutInference(pixelValues: pixelValues, model: model)
+        Self.trace("forward.inference.done logits=\(prediction.logits.shape) boxes=\(prediction.predBoxes.shape)")
+        return prediction
     }
 
     package func detect(
         image: CGImage,
         threshold: Float? = nil
     ) async throws -> [PPDocLayoutLayoutDetection] {
+        Self.trace("detect.start image=\(image.width)x\(image.height)")
         let pixelValues = try layoutPreprocess(image: image)
+        Self.trace("detect.preprocess shape=\(pixelValues.shape)")
         let model = try await loadedModel()
         let prediction = try layoutInference(pixelValues: pixelValues, model: model)
+        Self.trace(
+            "detect.inference.done logits=\(prediction.logits.shape) boxes=\(prediction.predBoxes.shape) order=\(prediction.orderLogits.shape) masks=\(prediction.outMasks.shape)"
+        )
         let targetSize = CGSize(width: image.width, height: image.height)
         let effectiveThreshold = threshold ?? options.threshold
         let id2label = resolvedID2Label(model: model)
-        return try layoutPostprocess(
+        let detections = try layoutPostprocess(
             prediction: prediction,
             targetSize: targetSize,
             threshold: effectiveThreshold,
             id2label: id2label
         )
+        Self.trace("detect.postprocess.done detections=\(detections.count)")
+        return detections
     }
 
     private func layoutPreprocess(image: CGImage) throws -> MLXArray {
@@ -159,10 +171,22 @@ package actor PPDocLayoutMLXRunner {
         modelTask = loadTask
 
         do {
-            return try await loadTask.value
+            let model = try await loadTask.value
+            Self.trace("loadedModel.ready modelID=\(modelID)")
+            return model
         } catch {
             modelTask = nil
+            Self.trace("loadedModel.failed modelID=\(modelID) error=\(error)")
             throw error
         }
+    }
+
+    private nonisolated static func trace(_ message: String) {
+        guard traceEnabled else {
+            return
+        }
+        let payload = "[PPDocLayoutMLXRunner] \(message)\n"
+        let data = payload.data(using: .utf8) ?? Data()
+        FileHandle.standardError.write(data)
     }
 }
