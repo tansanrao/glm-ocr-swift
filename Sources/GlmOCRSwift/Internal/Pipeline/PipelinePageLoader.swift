@@ -1,5 +1,6 @@
 import CoreGraphics
 import ImageIO
+import Dispatch
 import Foundation
 #if os(macOS)
 import GlmOCRPDFium
@@ -13,18 +14,60 @@ internal protocol PipelinePageLoading: Sendable {
 }
 
 internal struct PipelinePageLoader: PipelinePageLoading {
+    private final class RenderState: @unchecked Sendable {
+        private let lock = NSLock()
+        private(set) var firstError: GlmOCRError?
+        private var renderedPages: [CGImage?]
+
+        init(pageCount: Int) {
+            self.renderedPages = Array(repeating: nil, count: pageCount)
+        }
+
+        func shouldSkip() -> Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            return firstError != nil
+        }
+
+        func storeRenderedPage(_ image: CGImage, at index: Int) {
+            lock.lock()
+            renderedPages[index] = image
+            lock.unlock()
+        }
+
+        func storeError(_ error: GlmOCRError) {
+            lock.lock()
+            if firstError == nil {
+                firstError = error
+            }
+            lock.unlock()
+        }
+
+        func finish() throws -> [CGImage] {
+            lock.lock()
+            defer { lock.unlock() }
+            if let firstError {
+                throw firstError
+            }
+            return renderedPages.compactMap { $0 }
+        }
+    }
+
     private let pdfDPI: Double
     private let maxRenderedLongSide: Double
     private let defaultMaxPages: Int?
+    private let renderConcurrency: Int
 
     internal init(
         pdfDPI: Double = 200.0,
         maxRenderedLongSide: Double = 3500.0,
-        defaultMaxPages: Int? = nil
+        defaultMaxPages: Int? = nil,
+        renderConcurrency: Int = 2
     ) {
         self.pdfDPI = pdfDPI
         self.maxRenderedLongSide = maxRenderedLongSide
         self.defaultMaxPages = defaultMaxPages
+        self.renderConcurrency = max(1, renderConcurrency)
     }
 
     internal func loadPages(
@@ -74,6 +117,137 @@ internal struct PipelinePageLoader: PipelinePageLoading {
             pageCount: pageCount,
             maxPages: maxPages
         )
+        if renderConcurrency <= 1 {
+            return try renderSequentialPDFiumPages(
+                document: document,
+                requestedPageCount: requestedPageCount
+            )
+        }
+
+        let state = RenderState(pageCount: requestedPageCount)
+        let group = DispatchGroup()
+        let semaphore = DispatchSemaphore(value: renderConcurrency)
+
+        for pageIndex in 0 ..< requestedPageCount {
+            semaphore.wait()
+            group.enter()
+            DispatchQueue.global(qos: .userInitiated).async {
+                defer {
+                    semaphore.signal()
+                    group.leave()
+                }
+
+                if state.shouldSkip() {
+                    return
+                }
+
+                do {
+                    let rendered = try renderSinglePDFiumPage(
+                        data: data,
+                        pageIndex: pageIndex
+                    )
+                    state.storeRenderedPage(rendered, at: pageIndex)
+                } catch let error as GlmOCRError {
+                    state.storeError(error)
+                } catch {
+                    state.storeError(
+                        GlmOCRError.pdfRenderingFailed(
+                            "Unable to render PDF page \(pageIndex + 1): \(error.localizedDescription)"
+                        )
+                    )
+                }
+            }
+        }
+
+        group.wait()
+        return try state.finish()
+#else
+        guard let provider = CGDataProvider(data: data as CFData),
+              let document = CGPDFDocument(provider)
+        else {
+            throw GlmOCRError.invalidConfiguration("Unable to decode pdfData input")
+        }
+
+        let pageCount = document.numberOfPages
+        guard pageCount > 0 else {
+            throw GlmOCRError.invalidConfiguration("pdfData input has no pages")
+        }
+
+        let requestedPageCount = try resolveRequestedPageCount(pageCount: pageCount, maxPages: maxPages)
+        if renderConcurrency <= 1 {
+            return try renderSequentialCGPDFPages(
+                document: document,
+                requestedPageCount: requestedPageCount
+            )
+        }
+
+        let state = RenderState(pageCount: requestedPageCount)
+        let group = DispatchGroup()
+        let semaphore = DispatchSemaphore(value: renderConcurrency)
+
+        for pageIndex in 0 ..< requestedPageCount {
+            semaphore.wait()
+            group.enter()
+            DispatchQueue.global(qos: .userInitiated).async {
+                defer {
+                    semaphore.signal()
+                    group.leave()
+                }
+
+                if state.shouldSkip() {
+                    return
+                }
+
+                do {
+                    let rendered = try renderSingleCGPDFPage(
+                        data: data,
+                        pageNumber: pageIndex + 1
+                    )
+                    state.storeRenderedPage(rendered, at: pageIndex)
+                } catch let error as GlmOCRError {
+                    state.storeError(error)
+                } catch {
+                    state.storeError(
+                        GlmOCRError.pdfRenderingFailed(
+                            "Unable to render PDF page \(pageIndex + 1): \(error.localizedDescription)"
+                        )
+                    )
+                }
+            }
+        }
+
+        group.wait()
+        return try state.finish()
+#endif
+    }
+
+    private func resolveRequestedPageCount(
+        pageCount: Int,
+        maxPages: Int?
+    ) throws -> Int {
+        let effectiveLimit: Int?
+        // `defaultMaxPages` applies to PDF only, with `maxPages` taking precedence only when explicitly set.
+        if let maxPages, let defaultMaxPages {
+            effectiveLimit = min(maxPages, defaultMaxPages)
+        } else if let maxPages {
+            effectiveLimit = maxPages
+        } else {
+            effectiveLimit = defaultMaxPages
+        }
+
+        let requestedPageCount = effectiveLimit.map { min($0, pageCount) } ?? pageCount
+        guard requestedPageCount > 0 else {
+            throw GlmOCRError.invalidConfiguration("No PDF pages selected after maxPages filtering")
+        }
+
+        return requestedPageCount
+    }
+
+#if os(macOS)
+    private func renderSequentialPDFiumPages(
+        document: PDFiumDocument,
+        requestedPageCount: Int
+    ) throws -> [CGImage] {
         let rasterizer = PDFiumPageRasterizer()
         var renderedPages: [CGImage] = []
         renderedPages.reserveCapacity(requestedPageCount)
@@ -103,60 +277,42 @@ internal struct PipelinePageLoader: PipelinePageLoading {
                 )
             }
         }
-
         return renderedPages
-#else
-        guard let provider = CGDataProvider(data: data as CFData),
-              let document = CGPDFDocument(provider)
-        else {
-            throw GlmOCRError.invalidConfiguration("Unable to decode pdfData input")
-        }
-
-        let pageCount = document.numberOfPages
-        guard pageCount > 0 else {
-            throw GlmOCRError.invalidConfiguration("pdfData input has no pages")
-        }
-
-        let requestedPageCount = try resolveRequestedPageCount(pageCount: pageCount, maxPages: maxPages)
-
-        var renderedPages: [CGImage] = []
-        renderedPages.reserveCapacity(requestedPageCount)
-
-        for pageNumber in 1 ... requestedPageCount {
-            guard let page = document.page(at: pageNumber) else {
-                throw GlmOCRError.invalidConfiguration("Unable to access PDF page \(pageNumber)")
-            }
-
-            renderedPages.append(try render(page: page))
-        }
-
-        return renderedPages
-#endif
     }
 
-    private func resolveRequestedPageCount(
-        pageCount: Int,
-        maxPages: Int?
-    ) throws -> Int {
-        let effectiveLimit: Int?
-        // `defaultMaxPages` applies to PDF only, with `maxPages` taking precedence only when explicitly set.
-        if let maxPages, let defaultMaxPages {
-            effectiveLimit = min(maxPages, defaultMaxPages)
-        } else if let maxPages {
-            effectiveLimit = maxPages
-        } else {
-            effectiveLimit = defaultMaxPages
+    private func renderSinglePDFiumPage(data: Data, pageIndex: Int) throws -> CGImage {
+        let document: PDFiumDocument
+        do {
+            document = try PDFiumDocument(data: data)
+        } catch let error as PDFiumError {
+            throw GlmOCRError.pdfRenderingFailed(describePDFiumError(error))
+        } catch {
+            throw GlmOCRError.pdfRenderingFailed("Unable to initialize PDFium document: \(error.localizedDescription)")
         }
 
-        let requestedPageCount = effectiveLimit.map { min($0, pageCount) } ?? pageCount
-        guard requestedPageCount > 0 else {
-            throw GlmOCRError.invalidConfiguration("No PDF pages selected after maxPages filtering")
+        let page: PDFiumPage
+        do {
+            page = try document.page(at: pageIndex)
+        } catch let error as PDFiumError {
+            throw GlmOCRError.pdfRenderingFailed(describePDFiumError(error))
+        } catch {
+            throw GlmOCRError.pdfRenderingFailed("Unable to load PDF page \(pageIndex + 1): \(error.localizedDescription)")
         }
 
-        return requestedPageCount
+        do {
+            let rasterizer = PDFiumPageRasterizer()
+            return try rasterizer.render(
+                page: page,
+                dpi: pdfDPI,
+                maxRenderedLongSide: maxRenderedLongSide
+            )
+        } catch let error as PDFiumError {
+            throw GlmOCRError.pdfRenderingFailed(describePDFiumError(error))
+        } catch {
+            throw GlmOCRError.pdfRenderingFailed("Unable to render PDF page \(pageIndex + 1): \(error.localizedDescription)")
+        }
     }
 
-#if os(macOS)
     private func describePDFiumError(_ error: PDFiumError) -> String {
         switch error {
         case .libraryLoadFailed(let message):
@@ -174,6 +330,37 @@ internal struct PipelinePageLoader: PipelinePageLoading {
         case .cgImageCreateFailed(let width, let height):
             return "Unable to create CGImage from PDFium bitmap \(width)x\(height)"
         }
+    }
+#endif
+
+#if !os(macOS)
+    private func renderSequentialCGPDFPages(
+        document: CGPDFDocument,
+        requestedPageCount: Int
+    ) throws -> [CGImage] {
+        var renderedPages: [CGImage] = []
+        renderedPages.reserveCapacity(requestedPageCount)
+
+        for pageNumber in 1 ... requestedPageCount {
+            guard let page = document.page(at: pageNumber) else {
+                throw GlmOCRError.invalidConfiguration("Unable to access PDF page \(pageNumber)")
+            }
+
+            renderedPages.append(try render(page: page))
+        }
+        return renderedPages
+    }
+
+    private func renderSingleCGPDFPage(data: Data, pageNumber: Int) throws -> CGImage {
+        guard let provider = CGDataProvider(data: data as CFData),
+              let document = CGPDFDocument(provider)
+        else {
+            throw GlmOCRError.invalidConfiguration("Unable to decode pdfData input")
+        }
+        guard let page = document.page(at: pageNumber) else {
+            throw GlmOCRError.invalidConfiguration("Unable to access PDF page \(pageNumber)")
+        }
+        return try render(page: page)
     }
 #endif
 

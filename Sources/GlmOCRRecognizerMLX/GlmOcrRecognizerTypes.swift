@@ -1,3 +1,4 @@
+import CoreGraphics
 import Foundation
 import MLX
 
@@ -10,6 +11,16 @@ public enum GlmOcrRecognizerMLXError: Error, Equatable, Sendable {
     case processingFailed(String)
     case generationFailed(String)
     case pythonFallbackUnavailable(String)
+}
+
+public struct GlmOcrRecognizerBatchRequest: @unchecked Sendable {
+    public let prompt: String
+    public let image: CGImage
+
+    public init(prompt: String, image: CGImage) {
+        self.prompt = prompt
+        self.image = image
+    }
 }
 
 public struct GlmOcrTHW: Sendable, Codable, Equatable {

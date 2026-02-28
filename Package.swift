@@ -15,6 +15,10 @@ let package = Package(
         .library(
             name: "GlmOCRSwift",
             targets: ["GlmOCRSwift"]
+        ),
+        .executable(
+            name: "GlmOCRBenchmark",
+            targets: ["GlmOCRBenchmark"]
         )
     ],
     dependencies: [
@@ -100,6 +104,13 @@ let package = Package(
             dependencies: [
                 "GlmOCRSwift",
                 "GlmOCRRecognizerMLX"
+            ],
+            swiftSettings: strictConcurrency
+        ),
+        .executableTarget(
+            name: "GlmOCRBenchmark",
+            dependencies: [
+                "GlmOCRSwift"
             ],
             swiftSettings: strictConcurrency
         )

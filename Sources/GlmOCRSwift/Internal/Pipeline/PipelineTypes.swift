@@ -57,6 +57,45 @@ internal protocol PipelineLayoutDetecting: Sendable {
     ) async throws -> [[PipelineLayoutRegion]]
 }
 
+internal struct PipelineLayoutStageTimings: Sendable, Equatable {
+    internal var preprocessMs: Double
+    internal var inferenceMs: Double
+    internal var postprocessMs: Double
+
+    internal init(
+        preprocessMs: Double = 0,
+        inferenceMs: Double = 0,
+        postprocessMs: Double = 0
+    ) {
+        self.preprocessMs = preprocessMs
+        self.inferenceMs = inferenceMs
+        self.postprocessMs = postprocessMs
+    }
+}
+
+internal struct PipelineLayoutDetectionOutput: Sendable {
+    internal let pageRegions: [[PipelineLayoutRegion]]
+    internal let timings: PipelineLayoutStageTimings
+    internal let detectionCount: Int
+
+    internal init(
+        pageRegions: [[PipelineLayoutRegion]],
+        timings: PipelineLayoutStageTimings = .init(),
+        detectionCount: Int
+    ) {
+        self.pageRegions = pageRegions
+        self.timings = timings
+        self.detectionCount = detectionCount
+    }
+}
+
+internal protocol PipelineLayoutDetectingWithMetrics: PipelineLayoutDetecting {
+    func detectDetailedWithMetrics(
+        pages: [CGImage],
+        options: ParseOptions
+    ) async throws -> PipelineLayoutDetectionOutput
+}
+
 internal struct PipelineRegionRecord: Sendable, Equatable {
     internal var index: Int
     internal var nativeLabel: String

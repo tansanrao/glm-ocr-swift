@@ -2,6 +2,25 @@ import CoreGraphics
 import Foundation
 import MLX
 
+package struct PPDocLayoutDetailedDetections: Sendable {
+    package let detections: [PPDocLayoutLayoutDetection]
+    package let preprocessMs: Double
+    package let inferenceMs: Double
+    package let postprocessMs: Double
+
+    package init(
+        detections: [PPDocLayoutLayoutDetection],
+        preprocessMs: Double,
+        inferenceMs: Double,
+        postprocessMs: Double
+    ) {
+        self.detections = detections
+        self.preprocessMs = preprocessMs
+        self.inferenceMs = inferenceMs
+        self.postprocessMs = postprocessMs
+    }
+}
+
 package actor PPDocLayoutMLXRunner {
     private let modelID: String
     private let options: PPDocLayoutRuntimeOptions
@@ -34,14 +53,32 @@ package actor PPDocLayoutMLXRunner {
         image: CGImage,
         threshold: Float? = nil
     ) async throws -> [PPDocLayoutLayoutDetection] {
+        let detailed = try await detectDetailed(
+            image: image,
+            threshold: threshold
+        )
+        return detailed.detections
+    }
+
+    package func detectDetailed(
+        image: CGImage,
+        threshold: Float? = nil
+    ) async throws -> PPDocLayoutDetailedDetections {
         Self.trace("detect.start image=\(image.width)x\(image.height)")
+        let preprocessStart = Date()
         let pixelValues = try layoutPreprocess(image: image)
+        let preprocessMs = Date().timeIntervalSince(preprocessStart) * 1_000.0
         Self.trace("detect.preprocess shape=\(pixelValues.shape)")
+
+        let inferenceStart = Date()
         let model = try await loadedModel()
         let prediction = try layoutInference(pixelValues: pixelValues, model: model)
+        let inferenceMs = Date().timeIntervalSince(inferenceStart) * 1_000.0
         Self.trace(
             "detect.inference.done logits=\(prediction.logits.shape) boxes=\(prediction.predBoxes.shape) order=\(prediction.orderLogits.shape) masks=\(prediction.outMasks.shape)"
         )
+
+        let postprocessStart = Date()
         let targetSize = CGSize(width: image.width, height: image.height)
         let effectiveThreshold = threshold ?? options.threshold
         let id2label = resolvedID2Label(model: model)
@@ -49,10 +86,17 @@ package actor PPDocLayoutMLXRunner {
             prediction: prediction,
             targetSize: targetSize,
             threshold: effectiveThreshold,
-            id2label: id2label
+            id2label: id2label,
+            useFastBoundaryPath: options.layoutPostprocessFastPath
         )
+        let postprocessMs = Date().timeIntervalSince(postprocessStart) * 1_000.0
         Self.trace("detect.postprocess.done detections=\(detections.count)")
-        return detections
+        return PPDocLayoutDetailedDetections(
+            detections: detections,
+            preprocessMs: preprocessMs,
+            inferenceMs: inferenceMs,
+            postprocessMs: postprocessMs
+        )
     }
 
     private func layoutPreprocess(image: CGImage) throws -> MLXArray {
@@ -75,7 +119,8 @@ package actor PPDocLayoutMLXRunner {
         prediction: PPDocLayoutMLXPrediction,
         targetSize: CGSize,
         threshold: Float,
-        id2label: [Int: String]
+        id2label: [Int: String],
+        useFastBoundaryPath: Bool
     ) throws -> [PPDocLayoutLayoutDetection] {
         let preThreshold = minimumPostprocessThreshold(
             threshold: threshold,
@@ -86,7 +131,8 @@ package actor PPDocLayoutMLXRunner {
             prediction: prediction,
             targetSize: targetSize,
             threshold: preThreshold,
-            id2label: id2label
+            id2label: id2label,
+            useFastBoundaryPath: useFastBoundaryPath
         )
 
         rawDetections = applyPerClassThresholdIfNeeded(

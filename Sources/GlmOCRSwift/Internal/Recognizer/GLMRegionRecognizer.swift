@@ -1,5 +1,4 @@
 import CoreGraphics
-import CoreImage
 import Foundation
 import GlmOCRRecognizerMLX
 
@@ -7,7 +6,21 @@ internal protocol PromptRegionRecognizing: Sendable {
     func recognize(_ region: CGImage, prompt: String) async throws -> String
 }
 
-internal actor GLMRegionRecognizer: RegionRecognizer, PromptRegionRecognizing {
+internal struct PromptRecognitionRequest: @unchecked Sendable {
+    internal let image: CGImage
+    internal let prompt: String
+
+    internal init(image: CGImage, prompt: String) {
+        self.image = image
+        self.prompt = prompt
+    }
+}
+
+internal protocol BatchPromptRegionRecognizing: Sendable {
+    func recognizeBatch(_ requests: [PromptRecognitionRequest]) async throws -> [String]
+}
+
+internal actor GLMRegionRecognizer: RegionRecognizer, PromptRegionRecognizing, BatchPromptRegionRecognizing {
     private let config: GlmOCRConfig
     private let prompts: GlmOCRPromptConfig
     private let generationOptions: GlmOcrGenerationOptions
@@ -37,19 +50,31 @@ internal actor GLMRegionRecognizer: RegionRecognizer, PromptRegionRecognizing {
     }
 
     internal func recognize(_ region: CGImage, prompt: String) async throws -> String {
-        try Task.checkCancellation()
+        let batch = try await recognizeBatch([
+            PromptRecognitionRequest(image: region, prompt: prompt)
+        ])
+        return batch.first ?? ""
+    }
 
-        let ciImage = CIImage(cgImage: region)
+    internal func recognizeBatch(_ requests: [PromptRecognitionRequest]) async throws -> [String] {
+        try Task.checkCancellation()
+        guard !requests.isEmpty else {
+            return []
+        }
+
         let container = try await modelContainer()
-        let rawOutput = try await inferenceClient.recognize(
+        let rawOutputs = try await inferenceClient.recognizeBatch(
             container: container,
-            prompt: prompt,
-            image: ciImage,
+            requests: requests.map {
+                GLMInferenceRequest(prompt: $0.prompt, image: $0.image)
+            },
             generationOptions: generationOptions
         )
 
         try Task.checkCancellation()
-        return rawOutput.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
+        return rawOutputs.map {
+            $0.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
+        }
     }
 
     private func modelContainer() async throws -> any GLMInferenceContainer {

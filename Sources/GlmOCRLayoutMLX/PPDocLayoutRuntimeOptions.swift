@@ -8,6 +8,7 @@ package struct PPDocLayoutRuntimeOptions: Sendable {
     package var layoutMergeBBoxesMode: [Int: LayoutMergeMode]
     package var labelTaskMapping: [String: Set<String>]
     package var id2label: [Int: String]?
+    package var layoutPostprocessFastPath: Bool
 
     package init(
         threshold: Float = PPDocLayoutMLXContract.defaultDetectionThreshold,
@@ -16,7 +17,8 @@ package struct PPDocLayoutRuntimeOptions: Sendable {
         layoutUnclipRatio: (Double, Double) = PPDocLayoutMLXContract.defaultUnclipRatio,
         layoutMergeBBoxesMode: [Int: LayoutMergeMode] = PPDocLayoutMLXContract.layoutMergeBBoxesMode,
         labelTaskMapping: [String: Set<String>] = PPDocLayoutMLXContract.labelTaskMapping,
-        id2label: [Int: String]? = nil
+        id2label: [Int: String]? = nil,
+        layoutPostprocessFastPath: Bool = true
     ) {
         self.threshold = threshold
         self.thresholdByClass = thresholdByClass
@@ -25,5 +27,6 @@ package struct PPDocLayoutRuntimeOptions: Sendable {
         self.layoutMergeBBoxesMode = layoutMergeBBoxesMode
         self.labelTaskMapping = labelTaskMapping
         self.id2label = id2label
+        self.layoutPostprocessFastPath = layoutPostprocessFastPath
     }
 }

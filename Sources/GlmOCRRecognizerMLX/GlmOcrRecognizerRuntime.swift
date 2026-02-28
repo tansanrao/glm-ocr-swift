@@ -121,28 +121,65 @@ public actor GlmOcrRecognizerRuntime {
         image: CGImage,
         options: GlmOcrGenerationOptions = .fromEnvironment()
     ) async throws -> String {
-        trace("recognize.start")
-        if tracePixels, let source = Self.imageRGBSummary(image) {
-            trace("recognize.sourceRGB count=\(source.count) sum=\(source.sum) prefix=\(source.prefix)")
+        let outputs = try await recognizeBatch(
+            requests: [
+                GlmOcrRecognizerBatchRequest(prompt: prompt, image: image)
+            ],
+            options: options
+        )
+        return outputs.first ?? ""
+    }
+
+    public func recognizeBatch(
+        requests: [GlmOcrRecognizerBatchRequest],
+        options: GlmOcrGenerationOptions = .fromEnvironment()
+    ) async throws -> [String] {
+        try Task.checkCancellation()
+        guard !requests.isEmpty else {
+            return []
         }
-        let prepared = try processor.prepare(prompt: prompt, image: image)
-        trace("recognize.prepared tokens=\(prepared.inputIDs.count) grid=\(prepared.imageGridTHW.map { "[\($0.t),\($0.h),\($0.w)]" }.joined(separator: ","))")
-        if tracePixels {
-            let values = prepared.pixelValues.asArray(Float.self)
-            let prefix = Array(values.prefix(8))
-            let checksum = values.reduce(Float(0), +)
-            trace("recognize.pixels count=\(values.count) sum=\(checksum) prefix=\(prefix)")
+
+        trace("recognize.batch.start count=\(requests.count)")
+        var preparedInputs: [GlmOcrPreparedInput] = []
+        preparedInputs.reserveCapacity(requests.count)
+
+        for (index, request) in requests.enumerated() {
+            if tracePixels, let source = Self.imageRGBSummary(request.image) {
+                trace("recognize.batch[\(index)].sourceRGB count=\(source.count) sum=\(source.sum) prefix=\(source.prefix)")
+            }
+            let prepared = try processor.prepare(prompt: request.prompt, image: request.image)
+            trace(
+                "recognize.batch[\(index)].prepared tokens=\(prepared.inputIDs.count) grid=\(prepared.imageGridTHW.map { "[\($0.t),\($0.h),\($0.w)]" }.joined(separator: ","))"
+            )
+            if tracePixels {
+                let values = prepared.pixelValues.asArray(Float.self)
+                let prefix = Array(values.prefix(8))
+                let checksum = values.reduce(Float(0), +)
+                trace("recognize.batch[\(index)].pixels count=\(values.count) sum=\(checksum) prefix=\(prefix)")
+            }
+            preparedInputs.append(prepared)
         }
-        let generatedTokenIDs = try generate(prepared: prepared, options: options)
-        if traceAllTokens {
-            trace("recognize.tokens ids=\(generatedTokenIDs)")
+
+        let generatedTokenIDsBySample = try generateBatch(
+            preparedInputs: preparedInputs,
+            options: options
+        )
+        var outputs: [String] = []
+        outputs.reserveCapacity(generatedTokenIDsBySample.count)
+
+        for generatedTokenIDs in generatedTokenIDsBySample {
+            if traceAllTokens {
+                trace("recognize.tokens ids=\(generatedTokenIDs)")
+            }
+            trace("recognize.generated tokenCount=\(generatedTokenIDs.count)")
+            let decoded = tokenizer.decode(tokens: generatedTokenIDs)
+            if traceAllTokens {
+                trace("recognize.decoded text=\(decoded)")
+            }
+            outputs.append(decoded.trimmingCharacters(in: .whitespacesAndNewlines))
         }
-        trace("recognize.generated tokenCount=\(generatedTokenIDs.count)")
-        let decoded = tokenizer.decode(tokens: generatedTokenIDs)
-        if traceAllTokens {
-            trace("recognize.decoded text=\(decoded)")
-        }
-        return decoded.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        return outputs
     }
 
     private static func loadModel(
@@ -221,48 +258,85 @@ public actor GlmOcrRecognizerRuntime {
         prepared: GlmOcrPreparedInput,
         options: GlmOcrGenerationOptions
     ) throws -> [Int] {
-        var inputIDs = MLXArray(prepared.inputIDs).reshaped(1, prepared.inputIDs.count).asType(.int32)
-        var attentionMask = MLXArray(prepared.attentionMask).reshaped(1, prepared.attentionMask.count).asType(.int32)
-        let pixelValues = prepared.pixelValues
+        try generateBatch(preparedInputs: [prepared], options: options).first ?? []
+    }
 
-        let gridValues = prepared.imageGridTHW.flatMap { thw in
-            [Int32(thw.t), Int32(thw.h), Int32(thw.w)]
+    private func generateBatch(
+        preparedInputs: [GlmOcrPreparedInput],
+        options: GlmOcrGenerationOptions
+    ) throws -> [[Int]] {
+        guard !preparedInputs.isEmpty else {
+            return []
         }
-        let imageGridTHW = MLXArray(gridValues).reshaped(prepared.imageGridTHW.count, 3).asType(.int32)
 
-        var cache: [GlmOcrKVCache?] = (0 ..< modelBundle.modelConfig.textConfig.numHiddenLayers).map { _ in
+        let batchSize = preparedInputs.count
+        let maxPromptLength = preparedInputs.map(\.inputIDs.count).max() ?? 0
+        let padTokenID = Int32(modelBundle.generationConfig.padTokenID ?? modelBundle.modelConfig.padTokenID)
+
+        var flattenedInputIDs: [Int32] = []
+        flattenedInputIDs.reserveCapacity(batchSize * maxPromptLength)
+        var flattenedAttentionMask: [Int32] = []
+        flattenedAttentionMask.reserveCapacity(batchSize * maxPromptLength)
+
+        for prepared in preparedInputs {
+            let paddingCount = maxPromptLength - prepared.inputIDs.count
+            if paddingCount > 0 {
+                flattenedInputIDs.append(contentsOf: repeatElement(padTokenID, count: paddingCount))
+                flattenedAttentionMask.append(contentsOf: repeatElement(Int32(0), count: paddingCount))
+            }
+            flattenedInputIDs.append(contentsOf: prepared.inputIDs.map(Int32.init))
+            flattenedAttentionMask.append(contentsOf: repeatElement(Int32(1), count: prepared.inputIDs.count))
+        }
+
+        var inputIDs = MLXArray(flattenedInputIDs).reshaped(batchSize, maxPromptLength).asType(.int32)
+        var attentionMask = MLXArray(flattenedAttentionMask).reshaped(batchSize, maxPromptLength).asType(.int32)
+
+        let concatenatedPixelValues = concatenated(preparedInputs.map(\.pixelValues), axis: 0)
+        let flattenedGridValues = preparedInputs.flatMap { prepared in
+            prepared.imageGridTHW.flatMap { thw in
+                [Int32(thw.t), Int32(thw.h), Int32(thw.w)]
+            }
+        }
+        let gridCount = flattenedGridValues.count / 3
+        let imageGridTHW: MLXArray
+        if gridCount > 0 {
+            imageGridTHW = MLXArray(flattenedGridValues).reshaped(gridCount, 3).asType(.int32)
+        } else {
+            imageGridTHW = MLXArray.zeros([0, 3], dtype: .int32)
+        }
+
+        let cache: [GlmOcrKVCache?] = (0 ..< modelBundle.modelConfig.textConfig.numHiddenLayers).map { _ in
             GlmOcrSimpleKVCache()
         }
 
         var embeddings = model.getInputEmbeddings(
             inputIDs: inputIDs,
-            pixelValues: pixelValues,
+            pixelValues: concatenatedPixelValues,
             attentionMask: attentionMask,
             imageGridTHW: imageGridTHW
         ).inputEmbeddings
-        trace("generate.embeddings shape=\(embeddings.shape)")
+        trace("generate.batch.embeddings shape=\(embeddings.shape)")
 
         if options.prefillStepSize > 0, embeddings.dim(1) > options.prefillStepSize {
-            trace("generate.prefill chunking step=\(options.prefillStepSize)")
+            trace("generate.batch.prefill chunking step=\(options.prefillStepSize)")
             while embeddings.dim(1) > 1 {
                 let nToProcess = min(options.prefillStepSize, embeddings.dim(1) - 1)
-                trace("generate.prefill chunk=\(nToProcess) remaining=\(embeddings.dim(1))")
+                trace("generate.batch.prefill chunk=\(nToProcess) remaining=\(embeddings.dim(1))")
 
                 let chunkIDs = inputIDs[0..., ..<nToProcess]
                 let chunkEmbeddings = embeddings[0..., ..<nToProcess, 0...]
+                let chunkAttentionMask = attentionMask[0..., ..<nToProcess]
 
                 let chunkLogits = model.logits(
                     inputIDs: chunkIDs,
                     inputEmbeddings: chunkEmbeddings,
-                    attentionMask: attentionMask,
+                    attentionMask: chunkAttentionMask,
                     cache: cache,
-                    // Vision inputs are already merged into `chunkEmbeddings`.
-                    // Passing them again resets multimodal rope state and can corrupt decode caches.
                     pixelValues: nil,
                     imageGridTHW: nil
                 )
                 eval(chunkLogits)
-                trace("generate.prefill chunk complete")
+                trace("generate.batch.prefill chunk complete")
 
                 embeddings = embeddings[0..., nToProcess..., 0...]
                 inputIDs = inputIDs[0..., nToProcess...]
@@ -274,31 +348,48 @@ public actor GlmOcrRecognizerRuntime {
             let lastIndex = inputIDs.dim(1) - 1
             inputIDs = inputIDs[0..., lastIndex...]
             attentionMask = attentionMask[0..., lastIndex...]
-            trace("generate.prefill done promptReduced=\(inputIDs.shape)")
+            trace("generate.batch.prefill done promptReduced=\(inputIDs.shape)")
         }
 
-        var historyTokens: [Int] = []
+        var historyTokensBySample = Array(repeating: [Int](), count: batchSize)
 
-        let first = try generationStep(
+        var currentTokens = try generationStepBatch(
             inputIDs: inputIDs,
             inputEmbeddings: embeddings,
             cache: cache,
             attentionMask: attentionMask,
-            historyTokens: &historyTokens,
+            historyTokensBySample: &historyTokensBySample,
             options: options
         )
+        trace("generate.batch.first tokens=\(currentTokens)")
 
-        var currentToken = first
-        trace("generate.first token=\(currentToken)")
-        var generated: [Int] = []
-        generated.reserveCapacity(options.maxTokens)
+        var generatedBySample = Array(repeating: [Int](), count: batchSize)
+        for idx in generatedBySample.indices {
+            generatedBySample[idx].reserveCapacity(options.maxTokens)
+        }
+
+        var finished = currentTokens.map { eosTokenIDs.contains($0) }
 
         for index in 0 ..< options.maxTokens {
-            if eosTokenIDs.contains(currentToken) {
-                break
+            var activeCount = 0
+            for sampleIndex in 0 ..< batchSize {
+                if finished[sampleIndex] {
+                    continue
+                }
+
+                let token = currentTokens[sampleIndex]
+                if eosTokenIDs.contains(token) {
+                    finished[sampleIndex] = true
+                    continue
+                }
+
+                generatedBySample[sampleIndex].append(token)
+                activeCount += 1
             }
 
-            generated.append(currentToken)
+            if finished.allSatisfy({ $0 }) || activeCount == 0 {
+                break
+            }
 
             if index % 256 == 0 {
                 Memory.clearCache()
@@ -308,35 +399,42 @@ public actor GlmOcrRecognizerRuntime {
                 break
             }
 
-            let nextInput = MLXArray(currentToken).reshaped(1, 1).asType(.int32)
-            currentToken = try generationStep(
+            let nextInputValues: [Int32] = (0 ..< batchSize).map { sampleIndex in
+                if finished[sampleIndex] {
+                    return padTokenID
+                }
+                return Int32(currentTokens[sampleIndex])
+            }
+            let nextInput = MLXArray(nextInputValues).reshaped(batchSize, 1).asType(.int32)
+            currentTokens = try generationStepBatch(
                 inputIDs: nextInput,
                 inputEmbeddings: nil,
                 cache: cache,
                 attentionMask: nil,
-                historyTokens: &historyTokens,
+                historyTokensBySample: &historyTokensBySample,
                 options: options
             )
+
             if traceAllTokens || index < 4 {
-                trace("generate.step index=\(index + 1) token=\(currentToken)")
+                trace("generate.batch.step index=\(index + 1) tokens=\(currentTokens)")
             }
         }
 
-        return generated
+        return generatedBySample
     }
 
-    private func generationStep(
+    private func generationStepBatch(
         inputIDs: MLXArray,
         inputEmbeddings: MLXArray?,
         cache: [GlmOcrKVCache?],
         attentionMask: MLXArray?,
-        historyTokens: inout [Int],
+        historyTokensBySample: inout [[Int]],
         options: GlmOcrGenerationOptions
-    ) throws -> Int {
+    ) throws -> [Int] {
         let logits3D: MLXArray
 
         if let inputEmbeddings {
-            trace("generationStep.prefillDecode inputShape=\(inputIDs.shape) embedShape=\(inputEmbeddings.shape)")
+            trace("generationStepBatch.prefillDecode inputShape=\(inputIDs.shape) embedShape=\(inputEmbeddings.shape)")
             logits3D = model.logits(
                 inputIDs: inputIDs,
                 inputEmbeddings: inputEmbeddings,
@@ -346,7 +444,7 @@ public actor GlmOcrRecognizerRuntime {
                 imageGridTHW: nil
             )
         } else {
-            trace("generationStep.decodeOnly inputShape=\(inputIDs.shape)")
+            trace("generationStepBatch.decodeOnly inputShape=\(inputIDs.shape)")
             logits3D = model.decodeLogits(
                 inputIDs: inputIDs,
                 attentionMask: attentionMask,
@@ -356,16 +454,19 @@ public actor GlmOcrRecognizerRuntime {
         }
 
         var logits = logits3D[0..., -1, 0...]
-        trace("generationStep.logits shape=\(logits.shape)")
+        trace("generationStepBatch.logits shape=\(logits.shape)")
 
-        let stepTokens = inputIDs.asArray(Int32.self).map(Int.init)
-        historyTokens.append(contentsOf: stepTokens)
+        appendHistoryTokens(
+            inputIDs: inputIDs,
+            attentionMask: attentionMask,
+            historyTokensBySample: &historyTokensBySample
+        )
 
         if options.repetitionPenalty != 1 {
-            logits = applyRepetitionPenalty(
+            logits = applyRepetitionPenaltyBatch(
                 logits: logits,
                 penalty: options.repetitionPenalty,
-                tokens: historyTokens
+                historyTokensBySample: historyTokensBySample
             )
         }
 
@@ -373,34 +474,71 @@ public actor GlmOcrRecognizerRuntime {
         let sampled = sample(logprobs: logprobs, options: options)
 
         eval(sampled)
-        trace("generationStep.sampled")
-        return sampled.item(Int.self)
+        trace("generationStepBatch.sampled")
+        return sampled.asType(.int32).asArray(Int32.self).map(Int.init)
     }
 
-    private func applyRepetitionPenalty(
+    private func appendHistoryTokens(
+        inputIDs: MLXArray,
+        attentionMask: MLXArray?,
+        historyTokensBySample: inout [[Int]]
+    ) {
+        let batchSize = inputIDs.dim(0)
+        let sequenceLength = inputIDs.dim(1)
+
+        if historyTokensBySample.count < batchSize {
+            historyTokensBySample.append(
+                contentsOf: repeatElement([Int](), count: batchSize - historyTokensBySample.count)
+            )
+        }
+
+        let tokenValues = inputIDs.asArray(Int32.self).map(Int.init)
+        let maskValues = attentionMask?.asArray(Int32.self)
+
+        for batchIndex in 0 ..< batchSize {
+            let rowStart = batchIndex * sequenceLength
+            for column in 0 ..< sequenceLength {
+                let offset = rowStart + column
+                if let maskValues, maskValues[offset] == 0 {
+                    continue
+                }
+                historyTokensBySample[batchIndex].append(tokenValues[offset])
+            }
+        }
+    }
+
+    private func applyRepetitionPenaltyBatch(
         logits: MLXArray,
         penalty: Float,
-        tokens: [Int]
+        historyTokensBySample: [[Int]]
     ) -> MLXArray {
-        guard penalty > 0, !tokens.isEmpty else {
+        guard penalty > 0, !historyTokensBySample.isEmpty else {
             return logits
         }
 
-        let context = Array(tokens.suffix(repetitionContextSize))
-        guard !context.isEmpty else {
-            return logits
+        let adjusted = logits
+        let batchSize = adjusted.dim(0)
+
+        for batchIndex in 0 ..< batchSize {
+            guard batchIndex < historyTokensBySample.count else {
+                continue
+            }
+            let context = Array(historyTokensBySample[batchIndex].suffix(repetitionContextSize))
+            guard !context.isEmpty else {
+                continue
+            }
+
+            let contextArray = MLXArray(context).asType(.int32)
+            var selected = adjusted[batchIndex, contextArray]
+            selected = `where`(
+                selected .< 0,
+                selected * penalty,
+                selected / penalty
+            )
+            adjusted[batchIndex, contextArray] = selected
         }
 
-        var logits = logits
-        let contextArray = MLXArray(context).asType(.int32)
-        var selected = logits[0..., contextArray]
-        selected = `where`(
-            selected .< 0,
-            selected * penalty,
-            selected / penalty
-        )
-        logits[0..., contextArray] = selected
-        return logits
+        return adjusted
     }
 
     private func sample(logprobs: MLXArray, options: GlmOcrGenerationOptions) -> MLXArray {

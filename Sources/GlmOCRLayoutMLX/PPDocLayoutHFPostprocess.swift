@@ -35,7 +35,8 @@ internal enum PPDocLayoutHFPostprocess {
         prediction: PPDocLayoutMLXPrediction,
         targetSize: CGSize,
         threshold: Float,
-        id2label: [Int: String]
+        id2label: [Int: String],
+        useFastBoundaryPath: Bool = true
     ) throws -> [PPDocLayoutRawDetection] {
         try validateOutputShapes(prediction)
 
@@ -150,7 +151,8 @@ internal enum PPDocLayoutHFPostprocess {
                 mask: candidate.mask,
                 maskWidth: maskWidth,
                 maskHeight: maskHeight,
-                targetSize: targetSize
+                targetSize: targetSize,
+                useFastBoundaryPath: useFastBoundaryPath
             ) ?? fallbackRectangle(for: candidate.bbox)
 
             detections.append(
@@ -211,7 +213,8 @@ internal enum PPDocLayoutHFPostprocess {
         mask: [UInt8],
         maskWidth: Int,
         maskHeight: Int,
-        targetSize: CGSize
+        targetSize: CGSize,
+        useFastBoundaryPath: Bool = true
     ) -> [[Double]]? {
         let xMin = Int(box[0])
         let yMin = Int(box[1])
@@ -279,7 +282,12 @@ internal enum PPDocLayoutHFPostprocess {
             return rect
         }
 
-        guard var polygon = maskToPolygon(mask: resizedMask, width: boxW, height: boxH) else {
+        guard var polygon = maskToPolygon(
+            mask: resizedMask,
+            width: boxW,
+            height: boxH,
+            useFastBoundaryPath: useFastBoundaryPath
+        ) else {
             return rect
         }
 
@@ -295,8 +303,18 @@ internal enum PPDocLayoutHFPostprocess {
         return polygon
     }
 
-    private static func maskToPolygon(mask: [UInt8], width: Int, height: Int) -> [[Double]]? {
-        guard let contour = largestExternalContour(mask: mask, width: width, height: height), contour.count >= 3 else {
+    private static func maskToPolygon(
+        mask: [UInt8],
+        width: Int,
+        height: Int,
+        useFastBoundaryPath: Bool
+    ) -> [[Double]]? {
+        guard let contour = largestExternalContour(
+            mask: mask,
+            width: width,
+            height: height,
+            useFastBoundaryPath: useFastBoundaryPath
+        ), contour.count >= 3 else {
             return nil
         }
 
@@ -310,7 +328,12 @@ internal enum PPDocLayoutHFPostprocess {
         return extractCustomVertices(polygon)
     }
 
-    private static func largestExternalContour(mask: [UInt8], width: Int, height: Int) -> [IntPoint]? {
+    private static func largestExternalContour(
+        mask: [UInt8],
+        width: Int,
+        height: Int,
+        useFastBoundaryPath: Bool
+    ) -> [IntPoint]? {
         guard width > 0, height > 0 else {
             return nil
         }
@@ -322,7 +345,8 @@ internal enum PPDocLayoutHFPostprocess {
             (-1, 1), (0, 1), (1, 1)
         ]
 
-        var bestComponent: [IntPoint] = []
+        var bestComponentIndices: [Int] = []
+        var bestComponentMembership = [Bool](repeating: false, count: width * height)
         for y in 0 ..< height {
             for x in 0 ..< width {
                 let index = y * width + x
@@ -330,20 +354,22 @@ internal enum PPDocLayoutHFPostprocess {
                     continue
                 }
 
-                var queue: [IntPoint] = [IntPoint(x: x, y: y)]
+                var queue: [Int] = [index]
                 visited[index] = true
-                var component: [IntPoint] = []
-                component.reserveCapacity(128)
+                var componentIndices: [Int] = []
+                componentIndices.reserveCapacity(128)
 
                 var queueIndex = 0
                 while queueIndex < queue.count {
-                    let point = queue[queueIndex]
+                    let pointIndex = queue[queueIndex]
                     queueIndex += 1
-                    component.append(point)
+                    componentIndices.append(pointIndex)
+                    let pointX = pointIndex % width
+                    let pointY = pointIndex / width
 
                     for (dx, dy) in neighbors {
-                        let nx = point.x + dx
-                        let ny = point.y + dy
+                        let nx = pointX + dx
+                        let ny = pointY + dy
                         guard nx >= 0, nx < width, ny >= 0, ny < height else {
                             continue
                         }
@@ -351,23 +377,39 @@ internal enum PPDocLayoutHFPostprocess {
                         let nIndex = ny * width + nx
                         if !visited[nIndex], mask[nIndex] != 0 {
                             visited[nIndex] = true
-                            queue.append(IntPoint(x: nx, y: ny))
+                            queue.append(nIndex)
                         }
                     }
                 }
 
-                if component.count > bestComponent.count {
-                    bestComponent = component
+                if componentIndices.count > bestComponentIndices.count {
+                    for existingIndex in bestComponentIndices {
+                        bestComponentMembership[existingIndex] = false
+                    }
+                    for newIndex in componentIndices {
+                        bestComponentMembership[newIndex] = true
+                    }
+                    bestComponentIndices = componentIndices
                 }
             }
         }
 
-        guard !bestComponent.isEmpty else {
+        guard !bestComponentIndices.isEmpty else {
             return nil
         }
 
-        let componentSet = Set(bestComponent)
-        let boundary = boundaryPoints(component: componentSet, width: width, height: height)
+        let boundary: [IntPoint]
+        if useFastBoundaryPath {
+            boundary = boundaryPointsFast(
+                componentIndices: bestComponentIndices,
+                membership: bestComponentMembership,
+                width: width,
+                height: height
+            )
+        } else {
+            let componentSet = Set(bestComponentIndices.map { IntPoint(x: $0 % width, y: $0 / width) })
+            boundary = boundaryPoints(component: componentSet, width: width, height: height)
+        }
         guard boundary.count >= 3 else {
             return nil
         }
@@ -377,6 +419,38 @@ internal enum PPDocLayoutHFPostprocess {
             return nil
         }
         return ensureNegativeSignedArea(hull)
+    }
+
+    private static func boundaryPointsFast(
+        componentIndices: [Int],
+        membership: [Bool],
+        width: Int,
+        height: Int
+    ) -> [IntPoint] {
+        var boundary: [IntPoint] = []
+        boundary.reserveCapacity(componentIndices.count)
+
+        for index in componentIndices {
+            let x = index % width
+            let y = index / width
+
+            if x == 0 || y == 0 || x == width - 1 || y == height - 1 {
+                boundary.append(IntPoint(x: x, y: y))
+                continue
+            }
+
+            let neighbors = [
+                index - width, // up
+                index - 1, // left
+                index + 1, // right
+                index + width, // down
+            ]
+            if neighbors.contains(where: { !membership[$0] }) {
+                boundary.append(IntPoint(x: x, y: y))
+            }
+        }
+
+        return boundary
     }
 
     private static func boundaryPoints(
@@ -406,11 +480,25 @@ internal enum PPDocLayoutHFPostprocess {
     }
 
     private static func convexHull(points: [IntPoint]) -> [IntPoint] {
-        let uniqueSorted = Array(Set(points)).sorted { lhs, rhs in
+        guard !points.isEmpty else {
+            return []
+        }
+
+        let sorted = points.sorted { lhs, rhs in
             if lhs.x != rhs.x {
                 return lhs.x < rhs.x
             }
             return lhs.y < rhs.y
+        }
+
+        var uniqueSorted: [IntPoint] = []
+        uniqueSorted.reserveCapacity(sorted.count)
+        var previous: IntPoint?
+        for point in sorted {
+            if point != previous {
+                uniqueSorted.append(point)
+                previous = point
+            }
         }
 
         guard uniqueSorted.count >= 3 else {

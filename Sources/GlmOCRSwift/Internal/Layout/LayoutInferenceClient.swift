@@ -3,8 +3,22 @@ import Foundation
 
 import GlmOCRLayoutMLX
 
+internal struct LayoutDetectionDetailedOutput: Sendable {
+    internal let regions: [PipelineLayoutRegion]
+    internal let timings: PipelineLayoutStageTimings
+
+    internal init(
+        regions: [PipelineLayoutRegion],
+        timings: PipelineLayoutStageTimings
+    ) {
+        self.regions = regions
+        self.timings = timings
+    }
+}
+
 internal protocol LayoutInferenceClient: Sendable {
     func detectLayout(image: CGImage) async throws -> [PipelineLayoutRegion]
+    func detectLayoutDetailed(image: CGImage) async throws -> LayoutDetectionDetailedOutput
 }
 
 internal actor MLXLayoutInferenceClient: LayoutInferenceClient {
@@ -13,12 +27,18 @@ internal actor MLXLayoutInferenceClient: LayoutInferenceClient {
     internal init(config: GlmOCRConfig) {
         self.runner = PPDocLayoutMLXRunner(
             modelID: config.layoutModelID,
-            options: Self.makeRuntimeOptions(from: config.layout)
+            options: Self.makeRuntimeOptions(from: config)
         )
     }
 
     internal func detectLayout(image: CGImage) async throws -> [PipelineLayoutRegion] {
-        let detections = try await runner.detect(image: image)
+        let detailed = try await detectLayoutDetailed(image: image)
+        return detailed.regions
+    }
+
+    internal func detectLayoutDetailed(image: CGImage) async throws -> LayoutDetectionDetailedOutput {
+        let detailedDetections = try await runner.detectDetailed(image: image)
+        let detections = detailedDetections.detections
         let imageWidth = max(1, image.width)
         let imageHeight = max(1, image.height)
 
@@ -50,7 +70,14 @@ internal actor MLXLayoutInferenceClient: LayoutInferenceClient {
             validIndex += 1
         }
 
-        return regions
+        return LayoutDetectionDetailedOutput(
+            regions: regions,
+            timings: PipelineLayoutStageTimings(
+                preprocessMs: detailedDetections.preprocessMs,
+                inferenceMs: detailedDetections.inferenceMs,
+                postprocessMs: detailedDetections.postprocessMs
+            )
+        )
     }
 
     private func mapTask(_ task: PPDocLayoutTask) -> PipelineTask {
@@ -88,23 +115,24 @@ internal actor MLXLayoutInferenceClient: LayoutInferenceClient {
         }
     }
 
-    private static func makeRuntimeOptions(from config: GlmOCRLayoutConfig) -> PPDocLayoutRuntimeOptions {
-        let mergeModes = config.layoutMergeBBoxesMode.reduce(into: [Int: LayoutMergeMode]()) { partial, pair in
+    private static func makeRuntimeOptions(from config: GlmOCRConfig) -> PPDocLayoutRuntimeOptions {
+        let layoutConfig = config.layout
+        let mergeModes = layoutConfig.layoutMergeBBoxesMode.reduce(into: [Int: LayoutMergeMode]()) { partial, pair in
             guard let mode = LayoutMergeMode(rawValue: pair.value) else {
                 return
             }
             partial[pair.key] = mode
         }
 
-        let taskMapping = config.labelTaskMapping.reduce(into: [String: Set<String>]()) { partial, pair in
+        let taskMapping = layoutConfig.labelTaskMapping.reduce(into: [String: Set<String>]()) { partial, pair in
             partial[pair.key] = Set(pair.value)
         }
 
         return PPDocLayoutRuntimeOptions(
-            threshold: config.threshold,
-            thresholdByClass: config.thresholdByClass,
-            layoutNMS: config.layoutNMS,
-            layoutUnclipRatio: config.layoutUnclipRatio,
+            threshold: layoutConfig.threshold,
+            thresholdByClass: layoutConfig.thresholdByClass,
+            layoutNMS: layoutConfig.layoutNMS,
+            layoutUnclipRatio: layoutConfig.layoutUnclipRatio,
             layoutMergeBBoxesMode: mergeModes.isEmpty
                 ? GlmOCRLayoutConfig.defaultLayoutMergeBBoxesMode.reduce(into: [Int: LayoutMergeMode]()) { partial, pair in
                     if let mode = LayoutMergeMode(rawValue: pair.value) {
@@ -117,7 +145,8 @@ internal actor MLXLayoutInferenceClient: LayoutInferenceClient {
                     partial[pair.key] = Set(pair.value)
                 }
                 : taskMapping,
-            id2label: config.id2label
+            id2label: layoutConfig.id2label,
+            layoutPostprocessFastPath: config.performance.layoutPostprocessFastPath
         )
     }
 }

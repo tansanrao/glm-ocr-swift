@@ -1,12 +1,15 @@
 import CoreGraphics
 import CryptoKit
 import Foundation
+import ImageIO
+import UniformTypeIdentifiers
 
 import GlmOCRModelDelivery
 
 public actor GlmOCRPipeline {
     public nonisolated let config: GlmOCRConfig
     internal nonisolated let runtimeConfig: GlmOCRConfig
+    private nonisolated let performanceConfig: GlmOCRPerformanceConfig
     private let pageLoader: any PipelinePageLoading
     private let layoutDetector: any PipelineLayoutDetecting
     private let regionRecognizer: any RegionRecognizer
@@ -50,12 +53,15 @@ public actor GlmOCRPipeline {
         runtimeConfig.recognizerModelID = resolved.recognizerModelDirectory.path
         runtimeConfig.layoutModelID = resolved.layoutModelDirectory.path
 
+        let performanceConfig = config.effectivePerformanceConfig
         self.config = config
         self.runtimeConfig = runtimeConfig
+        self.performanceConfig = performanceConfig
         self.pageLoader = PipelinePageLoader(
             pdfDPI: runtimeConfig.pdfDPI,
             maxRenderedLongSide: runtimeConfig.pdfMaxRenderedLongSide,
-            defaultMaxPages: runtimeConfig.defaultMaxPages
+            defaultMaxPages: runtimeConfig.defaultMaxPages,
+            renderConcurrency: performanceConfig.pdfRenderConcurrency
         )
         self.layoutDetector = PPDocLayoutMLXDetector(config: runtimeConfig)
         self.regionRecognizer = GLMRegionRecognizer(config: runtimeConfig)
@@ -72,8 +78,10 @@ public actor GlmOCRPipeline {
         formatter: PipelineFormatter = PipelineFormatter()
     ) throws {
         try config.validate()
+        let performanceConfig = config.effectivePerformanceConfig
         self.config = config
         self.runtimeConfig = config
+        self.performanceConfig = performanceConfig
         self.pageLoader = pageLoader
         self.layoutDetector = layoutDetector
         self.regionRecognizer = regionRecognizer
@@ -83,13 +91,16 @@ public actor GlmOCRPipeline {
 
     public func parse(_ input: InputDocument, options: ParseOptions) async throws -> OCRDocumentResult {
         Self.trace(
-            "parse.start layout=\(config.enableLayout) maxConcurrent=\(config.maxConcurrentRecognitions) maxPagesOption=\(options.maxPages.map(String.init) ?? "nil") defaultMaxPages=\(config.defaultMaxPages.map(String.init) ?? "nil")"
+            "parse.start layout=\(config.enableLayout) maxConcurrent=\(config.maxConcurrentRecognitions) batchSize=\(performanceConfig.inferenceBatchSize) inflight=\(performanceConfig.inferenceMaxInflightJobs) maxPagesOption=\(options.maxPages.map(String.init) ?? "nil") defaultMaxPages=\(config.defaultMaxPages.map(String.init) ?? "nil")"
         )
         try options.validate()
         try Task.checkCancellation()
 
         var warnings: [String] = []
         var timingsMs: [String: Double] = [:]
+        var ocrPreprocessStats = OCRPreprocessStats()
+        var inferenceSchedulerStats = OCRInferenceSchedulerStats()
+        var layoutDetectionCount = 0
         let totalStart = Date()
         let effectiveMaxPages = resolvedEffectiveMaxPages(
             optionsMaxPages: options.maxPages,
@@ -118,19 +129,36 @@ public actor GlmOCRPipeline {
         let pagesAndMarkdown: (pages: [OCRPageResult], markdown: String)
         if config.enableLayout {
             Self.trace("parse.layout.detect.start pageCount=\(pages.count)")
-            let layoutStart = Date()
-            let detailedDetections = try await layoutDetector.detectDetailed(
-                pages: pages,
-                options: options
-            )
-            let layoutDuration = elapsedMilliseconds(since: layoutStart)
-            timingsMs["layout_preprocess"] = layoutDuration
-            timingsMs["layout_inference"] = layoutDuration
-            timingsMs["layout_postprocess"] = layoutDuration
+            let detailedDetections: [[PipelineLayoutRegion]]
+            if let metricsDetector = layoutDetector as? any PipelineLayoutDetectingWithMetrics {
+                let output = try await metricsDetector.detectDetailedWithMetrics(
+                    pages: pages,
+                    options: options
+                )
+                detailedDetections = output.pageRegions
+                layoutDetectionCount = output.detectionCount
+                timingsMs["layout_preprocess"] = output.timings.preprocessMs
+                timingsMs["layout_inference"] = output.timings.inferenceMs
+                timingsMs["layout_postprocess"] = output.timings.postprocessMs
+            } else {
+                let layoutStart = Date()
+                detailedDetections = try await layoutDetector.detectDetailed(
+                    pages: pages,
+                    options: options
+                )
+                let layoutDuration = elapsedMilliseconds(since: layoutStart)
+                timingsMs["layout_preprocess"] = layoutDuration
+                timingsMs["layout_inference"] = layoutDuration
+                timingsMs["layout_postprocess"] = layoutDuration
+                layoutDetectionCount = detailedDetections.reduce(0) { $0 + $1.count }
+            }
+
             let detectionSummary = detailedDetections.enumerated().map { index, regions in
                 "p\(index + 1)=\(regions.count)"
             }.joined(separator: ",")
-            Self.trace("parse.layout.detect.done pageRegions=[\(detectionSummary)] elapsedMs=\(layoutDuration)")
+            Self.trace(
+                "parse.layout.detect.done pageRegions=[\(detectionSummary)] preprocessMs=\(timingsMs["layout_preprocess"] ?? -1) inferenceMs=\(timingsMs["layout_inference"] ?? -1) postprocessMs=\(timingsMs["layout_postprocess"] ?? -1)"
+            )
 
             guard detailedDetections.count == pages.count else {
                 throw GlmOCRError.invalidConfiguration(
@@ -139,10 +167,11 @@ public actor GlmOCRPipeline {
             }
 
             let ocrPreprocessStart = Date()
-            let ocrPreprocessed = try ocrPreprocessLayoutRegions(
+            let ocrPreprocessed = try await ocrPreprocessLayoutRegions(
                 pages: pages,
                 detections: detailedDetections
             )
+            ocrPreprocessStats = ocrPreprocessed.stats
             warnings.append(contentsOf: ocrPreprocessed.warnings)
             timingsMs["ocr_preprocess"] = elapsedMilliseconds(since: ocrPreprocessStart)
             Self.trace(
@@ -161,9 +190,10 @@ public actor GlmOCRPipeline {
                 let ocrInferred = try await ocrInferenceRecognizeQueuedRegions(
                     jobs: ocrPreprocessed.recognitionJobs
                 )
+                inferenceSchedulerStats = ocrInferred.stats
                 timingsMs["ocr_inference"] = elapsedMilliseconds(since: ocrInferenceStart)
                 Self.trace(
-                    "parse.ocrInference.done results=\(ocrInferred.results.count) elapsedMs=\(timingsMs["ocr_inference"] ?? -1)"
+                    "parse.ocrInference.done results=\(ocrInferred.results.count) batches=\(ocrInferred.stats.batchCount) elapsedMs=\(timingsMs["ocr_inference"] ?? -1)"
                 )
                 merged = ocrInferenceMergeResults(
                     pageRegions: ocrPreprocessed.pageRegions,
@@ -181,15 +211,24 @@ public actor GlmOCRPipeline {
             )
         } else {
             timingsMs["ocr_preprocess"] = 0
+            ocrPreprocessStats = OCRPreprocessStats(
+                detectionCount: 0,
+                recognitionJobCount: pages.count,
+                recognitionTextJobCount: pages.count,
+                recognitionTableJobCount: 0,
+                recognitionFormulaJobCount: 0,
+                skipRegionCount: 0
+            )
             Self.trace("parse.noLayout.ocrInference.start pageCount=\(pages.count)")
             let ocrInferenceStart = Date()
             let recognizedContents = try await recognizeWholePages(
                 pages: pages
             )
             warnings.append(contentsOf: recognizedContents.warnings)
+            inferenceSchedulerStats = recognizedContents.stats
             timingsMs["ocr_inference"] = elapsedMilliseconds(since: ocrInferenceStart)
             Self.trace(
-                "parse.noLayout.ocrInference.done outputs=\(recognizedContents.contents.count) warnings=\(recognizedContents.warnings.count) elapsedMs=\(timingsMs["ocr_inference"] ?? -1)"
+                "parse.noLayout.ocrInference.done outputs=\(recognizedContents.contents.count) warnings=\(recognizedContents.warnings.count) batches=\(recognizedContents.stats.batchCount) elapsedMs=\(timingsMs["ocr_inference"] ?? -1)"
             )
 
             let ocrPostprocessStart = Date()
@@ -201,23 +240,65 @@ public actor GlmOCRPipeline {
         }
 
         timingsMs["total"] = elapsedMilliseconds(since: totalStart)
+        var markdownOutput = options.includeMarkdown ? pagesAndMarkdown.markdown : ""
 
-        let metadata: [String: String] = [
-            "layoutEnabled": config.enableLayout ? "true" : "false",
-            "pageCount": String(pages.count),
-            "maxConcurrentRecognitions": String(config.maxConcurrentRecognitions),
-            "maxPagesOption": options.maxPages.map(String.init) ?? "nil",
-            "defaultMaxPages": config.defaultMaxPages.map(String.init) ?? "nil",
-            "effectiveMaxPages": effectiveMaxPages.map(String.init) ?? "nil",
-            "pdfDPI": String(config.pdfDPI),
-            "pdfMaxRenderedLongSide": String(config.pdfMaxRenderedLongSide),
-            "noLayoutPromptHash": truncatedSHA256(config.prompts.noLayoutPrompt),
-            "textPromptHash": truncatedSHA256(config.prompts.textPrompt),
-            "tablePromptHash": truncatedSHA256(config.prompts.tablePrompt),
-            "formulaPromptHash": truncatedSHA256(config.prompts.formulaPrompt),
-            "pageRenderDebugDump": pageRenderDebug.path ?? "nil",
-            "pageRenderDebugCount": pageRenderDebug.path == nil ? "0" : String(pageRenderDebug.count)
-        ]
+        let bundleBuild: MarkdownBundleBuildOutput?
+        if config.enableLayout, config.markdownBundle.enabled, options.includeMarkdown {
+            let built = await buildMarkdownBundle(
+                pages: pages,
+                pageResults: pagesAndMarkdown.pages,
+                markdown: markdownOutput
+            )
+            markdownOutput = built.rewrittenMarkdown
+            warnings.append(contentsOf: built.warnings)
+            bundleBuild = built
+        } else {
+            bundleBuild = nil
+        }
+
+        let metadata: [String: String]
+        if options.includeDiagnostics {
+            metadata = [
+                "layoutEnabled": config.enableLayout ? "true" : "false",
+                "markdownBundleEnabled": config.markdownBundle.enabled ? "true" : "false",
+                "markdownBundleGenerated": bundleBuild == nil ? "false" : "true",
+                "markdownBundleFigureCount": String(bundleBuild?.figures.count ?? 0),
+                "pageCount": String(pages.count),
+                "layoutDetectionCount": String(layoutDetectionCount),
+                "maxConcurrentRecognitions": String(config.maxConcurrentRecognitions),
+                "maxPagesOption": options.maxPages.map(String.init) ?? "nil",
+                "defaultMaxPages": config.defaultMaxPages.map(String.init) ?? "nil",
+                "effectiveMaxPages": effectiveMaxPages.map(String.init) ?? "nil",
+                "pdfDPI": String(config.pdfDPI),
+                "pdfMaxRenderedLongSide": String(config.pdfMaxRenderedLongSide),
+                "inferenceBatchSize": String(performanceConfig.inferenceBatchSize),
+                "inferenceBatchMaxWaitMs": String(performanceConfig.inferenceBatchMaxWaitMs),
+                "inferenceMaxInflightJobs": String(performanceConfig.inferenceMaxInflightJobs),
+                "pdfRenderConcurrency": String(performanceConfig.pdfRenderConcurrency),
+                "ocrPreprocessConcurrency": String(performanceConfig.ocrPreprocessConcurrency),
+                "bundleEncodeConcurrency": String(performanceConfig.bundleEncodeConcurrency),
+                "layoutPostprocessFastPath": performanceConfig.layoutPostprocessFastPath ? "true" : "false",
+                "recognitionJobCount": String(ocrPreprocessStats.recognitionJobCount),
+                "recognitionTextJobCount": String(ocrPreprocessStats.recognitionTextJobCount),
+                "recognitionTableJobCount": String(ocrPreprocessStats.recognitionTableJobCount),
+                "recognitionFormulaJobCount": String(ocrPreprocessStats.recognitionFormulaJobCount),
+                "skipRegionCount": String(ocrPreprocessStats.skipRegionCount),
+                "detectionCount": String(ocrPreprocessStats.detectionCount),
+                "inferenceBucketCount": String(inferenceSchedulerStats.bucketCount),
+                "inferenceBatchCount": String(inferenceSchedulerStats.batchCount),
+                "inferenceMaxBatchSize": String(inferenceSchedulerStats.maxBatchSize),
+                "inferenceAverageBatchSize": String(format: "%.2f", inferenceSchedulerStats.averageBatchSize),
+                "inferenceQueuedJobCount": String(inferenceSchedulerStats.queuedJobCount),
+                "noLayoutPromptHash": truncatedSHA256(config.prompts.noLayoutPrompt),
+                "textPromptHash": truncatedSHA256(config.prompts.textPrompt),
+                "tablePromptHash": truncatedSHA256(config.prompts.tablePrompt),
+                "formulaPromptHash": truncatedSHA256(config.prompts.formulaPrompt),
+                "pageRenderDebugDump": pageRenderDebug.path ?? "nil",
+                "pageRenderDebugCount": pageRenderDebug.path == nil ? "0" : String(pageRenderDebug.count)
+            ]
+        } else {
+            metadata = [:]
+        }
 
         let diagnostics: ParseDiagnostics
         if options.includeDiagnostics {
@@ -230,10 +311,30 @@ public actor GlmOCRPipeline {
             diagnostics = ParseDiagnostics()
         }
 
+        let markdownBundle: OCRMarkdownBundle?
+        if let bundleBuild {
+            let documentJSON = makeMarkdownBundleDocumentJSON(
+                pages: pagesAndMarkdown.pages,
+                diagnostics: diagnostics,
+                figures: bundleBuild.figures
+            )
+            markdownBundle = OCRMarkdownBundle(
+                rewrittenMarkdown: markdownOutput,
+                documentJSON: documentJSON,
+                markdownFileName: config.markdownBundle.markdownFileName,
+                jsonFileName: config.markdownBundle.jsonFileName,
+                figuresDirectoryName: config.markdownBundle.figuresDirectoryName,
+                figures: bundleBuild.figures
+            )
+        } else {
+            markdownBundle = nil
+        }
+
         return OCRDocumentResult(
             pages: pagesAndMarkdown.pages,
-            markdown: options.includeMarkdown ? pagesAndMarkdown.markdown : "",
-            diagnostics: diagnostics
+            markdown: markdownOutput,
+            diagnostics: diagnostics,
+            markdownBundle: markdownBundle
         )
     }
 
@@ -248,14 +349,10 @@ public actor GlmOCRPipeline {
 
     private func recognizeWholePages(
         pages: [CGImage]
-    ) async throws -> (contents: [String], warnings: [String]) {
+    ) async throws -> (contents: [String], warnings: [String], stats: OCRInferenceSchedulerStats) {
         guard !pages.isEmpty else {
-            return ([], [])
+            return ([], [], OCRInferenceSchedulerStats())
         }
-
-        let limiter = AsyncLimiter(limit: config.maxConcurrentRecognitions)
-        let recognizer = regionRecognizer
-        let promptRecognizer = recognizer as? PromptRegionRecognizing
 
         var results = Array(repeating: "", count: pages.count)
         var warnings: [String] = []
@@ -268,48 +365,29 @@ public actor GlmOCRPipeline {
             )
         }
 
-        try await withThrowingTaskGroup(of: (Int, Result<String, Error>).self) { group in
-            for job in jobs {
-                group.addTask {
-                    do {
-                        try Task.checkCancellation()
-                        let recognized = try await limiter.withPermit {
-                            try await self.recognize(
-                                job: job,
-                                recognizer: recognizer,
-                                promptRecognizer: promptRecognizer
-                            )
-                        }
-                        return (job.key.pageIndex, .success(recognized))
-                    } catch {
-                        if error is CancellationError {
-                            throw error
-                        }
-                        return (job.key.pageIndex, .failure(error))
-                    }
-                }
-            }
-
-            for try await (pageIndex, result) in group {
-                switch result {
-                case .success(let text):
-                    results[pageIndex] = text
-                case .failure(let error):
-                    results[pageIndex] = ""
-                    warnings.append("page[\(pageIndex)] recognition failed: \(error)")
-                }
+        let inference = try await ocrInferenceRecognizeQueuedRegions(jobs: jobs)
+        for job in jobs {
+            switch inference.results[job.key] {
+            case .success(let text):
+                results[job.key.pageIndex] = text
+            case .failure(let error):
+                results[job.key.pageIndex] = ""
+                warnings.append("page[\(job.key.pageIndex)] recognition failed: \(error)")
+            case nil:
+                results[job.key.pageIndex] = ""
+                warnings.append("page[\(job.key.pageIndex)] recognition failed: missing result")
             }
         }
 
-        return (results, warnings)
+        return (results, warnings, inference.stats)
     }
 
     private func ocrPreprocessLayoutRegions(
         pages: [CGImage],
         detections: [[PipelineLayoutRegion]]
-    ) throws -> OCRPreprocessOutput {
+    ) async throws -> OCRPreprocessOutput {
         let pageUnits = ocrPreprocessBuildPageUnits(pages: pages, detections: detections)
-        return try ocrPreprocessCropAndQueueRegions(units: pageUnits)
+        return try await ocrPreprocessCropAndQueueRegions(units: pageUnits)
     }
 
     private func ocrPreprocessBuildPageUnits(
@@ -327,107 +405,67 @@ public actor GlmOCRPipeline {
 
     private func ocrPreprocessCropAndQueueRegions(
         units: [OCRPreprocessPageUnit]
-    ) throws -> OCRPreprocessOutput {
+    ) async throws -> OCRPreprocessOutput {
+        guard !units.isEmpty else {
+            return OCRPreprocessOutput(
+                pageRegions: [],
+                recognitionJobs: [],
+                warnings: [],
+                stats: OCRPreprocessStats()
+            )
+        }
+
         var pageRegions: [[PipelineRegionRecord]] = Array(repeating: [], count: units.count)
         var recognitionJobs: [PipelineRecognitionJob] = []
         var warnings: [String] = []
+        var stats = OCRPreprocessStats()
         var ocrPreprocessDebugEntries: [[String: Any]] = []
         let ocrPreprocessDumpPath = ProcessInfo.processInfo.environment["GLMOCR_DEBUG_OCR_PREPROCESS_DUMP"]
         let shouldDumpOCRPreprocess = ocrPreprocessDumpPath?
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .isEmpty == false
 
-        for unit in units {
-            try Task.checkCancellation()
-
-            for detection in unit.detections {
-                if detection.task == .abandon {
-                    continue
-                }
-
-                let regionPosition = pageRegions[unit.pageIndex].count
-                var record = PipelineRegionRecord(
-                    index: detection.index,
-                    nativeLabel: detection.label,
-                    task: detection.task,
-                    bbox2D: detection.bbox2D,
-                    content: nil
-                )
-
-                let debugEntry: [String: Any]? = shouldDumpOCRPreprocess ? [
-                    "pageIndex": unit.pageIndex,
-                    "detectionIndex": detection.index,
-                    "order": detection.order,
-                    "regionPosition": regionPosition,
-                    "task": detection.task.rawValue,
-                    "nativeLabel": detection.label,
-                    "bbox2D": detection.bbox2D,
-                    "polygon2D": detection.polygon2D
-                ] : nil
-
-                if let ocrTask = detection.task.ocrTask {
-                    do {
-                        let cropResult = try regionCropper.cropRegion(
-                            page: unit.image,
-                            bbox2D: detection.bbox2D,
-                            polygon2D: detection.polygon2D,
-                            pageIndex: unit.pageIndex,
-                            regionIndex: detection.index
+        let limiter = AsyncLimiter(limit: performanceConfig.ocrPreprocessConcurrency)
+        let cropper = regionCropper
+        let pageOutputs: [OCRPreprocessPageOutput] = try await withThrowingTaskGroup(of: OCRPreprocessPageOutput.self) { group in
+            for unit in units {
+                group.addTask {
+                    try await limiter.withPermit {
+                        try Task.checkCancellation()
+                        return try Self.preprocessPage(
+                            unit: unit,
+                            cropper: cropper,
+                            shouldDumpDebugEntries: shouldDumpOCRPreprocess
                         )
-
-                        if let warning = cropResult.warning {
-                            warnings.append(warning)
-                        }
-
-                        recognitionJobs.append(
-                            PipelineRecognitionJob(
-                                key: PipelineRecognitionJobKey(
-                                    pageIndex: unit.pageIndex,
-                                    regionPosition: regionPosition
-                                ),
-                                image: cropResult.image,
-                                task: ocrTask
-                            )
-                        )
-
-                        if var debugEntry {
-                            if let cropMetadata = cropDebugMetadata(for: cropResult.image) {
-                                debugEntry["cropWidth"] = cropMetadata.width
-                                debugEntry["cropHeight"] = cropMetadata.height
-                                debugEntry["cropChannels"] = cropMetadata.channels
-                                debugEntry["cropPixelSHA256"] = cropMetadata.sha256
-                            } else {
-                                debugEntry["cropWidth"] = NSNull()
-                                debugEntry["cropHeight"] = NSNull()
-                                debugEntry["cropChannels"] = NSNull()
-                                debugEntry["cropPixelSHA256"] = NSNull()
-                            }
-                            ocrPreprocessDebugEntries.append(debugEntry)
-                        }
-                    } catch {
-                        record.content = ""
-                        warnings.append(
-                            "page[\(unit.pageIndex)] region[\(detection.index)] crop failed: \(error)"
-                        )
-                        if var debugEntry {
-                            debugEntry["cropWidth"] = NSNull()
-                            debugEntry["cropHeight"] = NSNull()
-                            debugEntry["cropChannels"] = NSNull()
-                            debugEntry["cropPixelSHA256"] = NSNull()
-                            ocrPreprocessDebugEntries.append(debugEntry)
-                        }
                     }
-                } else if var debugEntry {
-                    debugEntry["cropWidth"] = NSNull()
-                    debugEntry["cropHeight"] = NSNull()
-                    debugEntry["cropChannels"] = NSNull()
-                    debugEntry["cropPixelSHA256"] = NSNull()
-                    ocrPreprocessDebugEntries.append(debugEntry)
                 }
+            }
 
-                pageRegions[unit.pageIndex].append(record)
+            var collected: [OCRPreprocessPageOutput] = []
+            collected.reserveCapacity(units.count)
+            for try await output in group {
+                collected.append(output)
+            }
+            return collected.sorted { lhs, rhs in
+                lhs.pageIndex < rhs.pageIndex
             }
         }
+
+        for output in pageOutputs {
+            pageRegions[output.pageIndex] = output.pageRegions
+            recognitionJobs.append(contentsOf: output.recognitionJobs)
+            warnings.append(contentsOf: output.warnings)
+            ocrPreprocessDebugEntries.append(contentsOf: output.debugEntries)
+            stats.detectionCount += output.detectionCount
+            stats.skipRegionCount += output.skipRegionCount
+            stats.recognitionTextJobCount += output.recognitionTextJobCount
+            stats.recognitionTableJobCount += output.recognitionTableJobCount
+            stats.recognitionFormulaJobCount += output.recognitionFormulaJobCount
+        }
+
+        stats.recognitionJobCount = stats.recognitionTextJobCount
+            + stats.recognitionTableJobCount
+            + stats.recognitionFormulaJobCount
 
         if let ocrPreprocessDumpPath,
            !ocrPreprocessDumpPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
@@ -439,48 +477,172 @@ public actor GlmOCRPipeline {
         return OCRPreprocessOutput(
             pageRegions: pageRegions,
             recognitionJobs: recognitionJobs,
-            warnings: warnings
+            warnings: warnings,
+            stats: stats
         )
+    }
+
+    private nonisolated static func preprocessPage(
+        unit: OCRPreprocessPageUnit,
+        cropper: any PipelineRegionCropping,
+        shouldDumpDebugEntries: Bool
+    ) throws -> OCRPreprocessPageOutput {
+        var pageRegions: [PipelineRegionRecord] = []
+        pageRegions.reserveCapacity(unit.detections.count)
+        var recognitionJobs: [PipelineRecognitionJob] = []
+        recognitionJobs.reserveCapacity(unit.detections.count)
+        var warnings: [String] = []
+        var debugEntries: [[String: Any]] = []
+        var output = OCRPreprocessPageOutput(pageIndex: unit.pageIndex)
+
+        for detection in unit.detections {
+            if detection.task == .abandon {
+                continue
+            }
+
+            output.detectionCount += 1
+            if detection.task == .skip {
+                output.skipRegionCount += 1
+            }
+
+            let regionPosition = pageRegions.count
+            var record = PipelineRegionRecord(
+                index: detection.index,
+                nativeLabel: detection.label,
+                task: detection.task,
+                bbox2D: detection.bbox2D,
+                content: nil
+            )
+
+            let debugEntry: [String: Any]? = shouldDumpDebugEntries ? [
+                "pageIndex": unit.pageIndex,
+                "detectionIndex": detection.index,
+                "order": detection.order,
+                "regionPosition": regionPosition,
+                "task": detection.task.rawValue,
+                "nativeLabel": detection.label,
+                "bbox2D": detection.bbox2D,
+                "polygon2D": detection.polygon2D
+            ] : nil
+
+            if let ocrTask = detection.task.ocrTask {
+                do {
+                    let cropResult = try cropper.cropRegion(
+                        page: unit.image,
+                        bbox2D: detection.bbox2D,
+                        polygon2D: detection.polygon2D,
+                        pageIndex: unit.pageIndex,
+                        regionIndex: detection.index
+                    )
+
+                    if let warning = cropResult.warning {
+                        warnings.append(warning)
+                    }
+
+                    recognitionJobs.append(
+                        PipelineRecognitionJob(
+                            key: PipelineRecognitionJobKey(
+                                pageIndex: unit.pageIndex,
+                                regionPosition: regionPosition
+                            ),
+                            image: cropResult.image,
+                            task: ocrTask
+                        )
+                    )
+
+                    switch ocrTask {
+                    case .text:
+                        output.recognitionTextJobCount += 1
+                    case .table:
+                        output.recognitionTableJobCount += 1
+                    case .formula:
+                        output.recognitionFormulaJobCount += 1
+                    }
+
+                    if var debugEntry {
+                        if let cropMetadata = Self.cropDebugMetadata(for: cropResult.image) {
+                            debugEntry["cropWidth"] = cropMetadata.width
+                            debugEntry["cropHeight"] = cropMetadata.height
+                            debugEntry["cropChannels"] = cropMetadata.channels
+                            debugEntry["cropPixelSHA256"] = cropMetadata.sha256
+                        } else {
+                            debugEntry["cropWidth"] = NSNull()
+                            debugEntry["cropHeight"] = NSNull()
+                            debugEntry["cropChannels"] = NSNull()
+                            debugEntry["cropPixelSHA256"] = NSNull()
+                        }
+                        debugEntries.append(debugEntry)
+                    }
+                } catch {
+                    record.content = ""
+                    warnings.append(
+                        "page[\(unit.pageIndex)] region[\(detection.index)] crop failed: \(error)"
+                    )
+                    if var debugEntry {
+                        debugEntry["cropWidth"] = NSNull()
+                        debugEntry["cropHeight"] = NSNull()
+                        debugEntry["cropChannels"] = NSNull()
+                        debugEntry["cropPixelSHA256"] = NSNull()
+                        debugEntries.append(debugEntry)
+                    }
+                }
+            } else if var debugEntry {
+                debugEntry["cropWidth"] = NSNull()
+                debugEntry["cropHeight"] = NSNull()
+                debugEntry["cropChannels"] = NSNull()
+                debugEntry["cropPixelSHA256"] = NSNull()
+                debugEntries.append(debugEntry)
+            }
+
+            pageRegions.append(record)
+        }
+
+        output.pageRegions = pageRegions
+        output.recognitionJobs = recognitionJobs
+        output.warnings = warnings
+        output.debugEntries = debugEntries
+        return output
     }
 
     private func ocrInferenceRecognizeQueuedRegions(
         jobs: [PipelineRecognitionJob]
     ) async throws -> OCRInferenceOutput {
-        let recognizer = regionRecognizer
-        let promptRecognizer = recognizer as? PromptRegionRecognizing
-        let limiter = AsyncLimiter(limit: config.maxConcurrentRecognitions)
-
-        var recognitionResults: [PipelineRecognitionJobKey: Result<String, Error>] = [:]
-        recognitionResults.reserveCapacity(jobs.count)
-
-        try await withThrowingTaskGroup(of: (PipelineRecognitionJobKey, Result<String, Error>).self) { group in
-            for job in jobs {
-                group.addTask {
-                    do {
-                        try Task.checkCancellation()
-                        let recognized = try await limiter.withPermit {
-                            try await self.recognize(
-                                job: job,
-                                recognizer: recognizer,
-                                promptRecognizer: promptRecognizer
-                            )
-                        }
-                        return (job.key, .success(recognized))
-                    } catch {
-                        if error is CancellationError {
-                            throw error
-                        }
-                        return (job.key, .failure(error))
-                    }
-                }
-            }
-
-            for try await (key, result) in group {
-                recognitionResults[key] = result
-            }
+        guard !jobs.isEmpty else {
+            return OCRInferenceOutput(
+                results: [:],
+                stats: OCRInferenceSchedulerStats(
+                    requestedBatchSize: performanceConfig.inferenceBatchSize,
+                    maxInflightJobs: performanceConfig.inferenceMaxInflightJobs,
+                    batchMaxWaitMs: performanceConfig.inferenceBatchMaxWaitMs
+                )
+            )
         }
 
-        return OCRInferenceOutput(results: recognitionResults)
+        let batchedJobs = jobs.map { job in
+            OCRInferenceBatchJob(
+                key: job.key,
+                image: job.image,
+                task: job.task,
+                prompt: resolvedPrompt(for: job)
+            )
+        }
+
+        let scheduler = OCRInferenceScheduler(
+            requestedBatchSize: performanceConfig.inferenceBatchSize,
+            maxInflightJobs: performanceConfig.inferenceMaxInflightJobs,
+            batchMaxWaitMs: performanceConfig.inferenceBatchMaxWaitMs
+        )
+        let schedulerResult = try await scheduler.run(
+            jobs: batchedJobs,
+            executor: { [self] batch in
+                try await executeInferenceBatch(batch)
+            }
+        )
+
+        return OCRInferenceOutput(
+            results: schedulerResult.results,
+            stats: schedulerResult.stats
+        )
     }
 
     private func ocrInferenceMergeResults(
@@ -539,6 +701,421 @@ public actor GlmOCRPipeline {
         return try await recognizer.recognize(job.image, task: job.task)
     }
 
+    private func resolvedPrompt(for job: PipelineRecognitionJob) -> String {
+        if let prompt = job.promptOverride?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !prompt.isEmpty
+        {
+            return prompt
+        }
+        return RecognitionPromptMapper.prompt(for: job.task, prompts: config.prompts)
+    }
+
+    private func executeInferenceBatch(
+        _ batch: [OCRInferenceBatchJob]
+    ) async throws -> [Result<String, Error>] {
+        try Task.checkCancellation()
+        guard !batch.isEmpty else {
+            return []
+        }
+
+        let recognizer = regionRecognizer
+        let promptRecognizer = recognizer as? PromptRegionRecognizing
+        let batchPromptRecognizer = recognizer as? BatchPromptRegionRecognizing
+
+        if let batchPromptRecognizer {
+            do {
+                let outputs = try await batchPromptRecognizer.recognizeBatch(
+                    batch.map {
+                        PromptRecognitionRequest(
+                            image: $0.image,
+                            prompt: $0.prompt
+                        )
+                    }
+                )
+                guard outputs.count == batch.count else {
+                    let error = GlmOCRError.invalidConfiguration(
+                        "Batch recognizer returned \(outputs.count) results for \(batch.count) requests"
+                    )
+                    return batch.map { _ in
+                        Result<String, Error>.failure(error)
+                    }
+                }
+                return outputs.map { Result<String, Error>.success($0) }
+            } catch {
+                if error is CancellationError {
+                    throw error
+                }
+                return batch.map { _ in
+                    Result<String, Error>.failure(error)
+                }
+            }
+        }
+
+        var fallbackResults: [Result<String, Error>] = []
+        fallbackResults.reserveCapacity(batch.count)
+        for entry in batch {
+            let job = PipelineRecognitionJob(
+                key: entry.key,
+                image: entry.image,
+                task: entry.task,
+                promptOverride: entry.prompt
+            )
+            do {
+                let output = try await recognize(
+                    job: job,
+                    recognizer: recognizer,
+                    promptRecognizer: promptRecognizer
+                )
+                fallbackResults.append(.success(output))
+            } catch {
+                if error is CancellationError {
+                    throw error
+                }
+                fallbackResults.append(.failure(error))
+            }
+        }
+        return fallbackResults
+    }
+
+    private func buildMarkdownBundle(
+        pages: [CGImage],
+        pageResults: [OCRPageResult],
+        markdown: String
+    ) async -> MarkdownBundleBuildOutput {
+        let figureCandidates = collectFigureCandidates(from: pageResults)
+        guard !figureCandidates.isEmpty else {
+            return MarkdownBundleBuildOutput(
+                rewrittenMarkdown: markdown,
+                figures: [],
+                warnings: []
+            )
+        }
+
+        let limiter = AsyncLimiter(limit: performanceConfig.bundleEncodeConcurrency)
+        let figureFormat = config.markdownBundle.figureFormat
+        let figuresDirectoryName = config.markdownBundle.figuresDirectoryName
+        let heicCompressionQuality = config.markdownBundle.heicCompressionQuality
+
+        let outputs: [MarkdownBundleFigureOutput] = await withTaskGroup(of: MarkdownBundleFigureOutput.self) { group in
+            for (candidateIndex, candidate) in figureCandidates.enumerated() {
+                group.addTask {
+                    (try? await limiter.withPermit {
+                        Self.buildFigureOutput(
+                            candidateIndex: candidateIndex,
+                            candidate: candidate,
+                            pages: pages,
+                            figureFormat: figureFormat,
+                            figuresDirectoryName: figuresDirectoryName,
+                            heicCompressionQuality: heicCompressionQuality
+                        )
+                    }) ?? MarkdownBundleFigureOutput(
+                        candidateIndex: candidateIndex,
+                        figure: nil,
+                        warning: "bundle.figure encode failed: page=\(candidate.pageIndex) region=\(candidate.regionIndex)"
+                    )
+                }
+            }
+
+            var collected: [MarkdownBundleFigureOutput] = []
+            collected.reserveCapacity(figureCandidates.count)
+            for await output in group {
+                collected.append(output)
+            }
+            return collected.sorted { lhs, rhs in
+                lhs.candidateIndex < rhs.candidateIndex
+            }
+        }
+
+        var figures: [OCRFigureAsset] = []
+        figures.reserveCapacity(outputs.count)
+        var figurePathsByCandidate: [String?] = Array(repeating: nil, count: figureCandidates.count)
+        var warnings: [String] = []
+
+        for output in outputs {
+            if let warning = output.warning {
+                warnings.append(warning)
+            }
+            if let figure = output.figure {
+                figures.append(figure)
+                figurePathsByCandidate[output.candidateIndex] = figure.relativePath
+            }
+        }
+
+        let rewritten = rewriteMarkdownFigureMarkers(
+            markdown: markdown,
+            figurePathsByCandidate: figurePathsByCandidate
+        )
+        warnings.append(contentsOf: rewritten.warnings)
+
+        return MarkdownBundleBuildOutput(
+            rewrittenMarkdown: rewritten.markdown,
+            figures: figures,
+            warnings: warnings
+        )
+    }
+
+    private func collectFigureCandidates(from pageResults: [OCRPageResult]) -> [FigureCandidate] {
+        var candidates: [FigureCandidate] = []
+        for (pageIndex, page) in pageResults.enumerated() {
+            let sortedRegions = page.regions.sorted { lhs, rhs in
+                lhs.index < rhs.index
+            }
+            for region in sortedRegions {
+                guard region.label == "image", let bbox = region.bbox2D, bbox.count == 4 else {
+                    continue
+                }
+                candidates.append(
+                    FigureCandidate(
+                        pageIndex: pageIndex,
+                        regionIndex: region.index,
+                        label: region.label,
+                        bbox2D: bbox
+                    )
+                )
+            }
+        }
+        return candidates
+    }
+
+    private nonisolated static func buildFigureOutput(
+        candidateIndex: Int,
+        candidate: FigureCandidate,
+        pages: [CGImage],
+        figureFormat: GlmOCRFigureFormat,
+        figuresDirectoryName: String,
+        heicCompressionQuality: Double
+    ) -> MarkdownBundleFigureOutput {
+        guard candidate.pageIndex >= 0, candidate.pageIndex < pages.count else {
+            return MarkdownBundleFigureOutput(
+                candidateIndex: candidateIndex,
+                figure: nil,
+                warning: "bundle.figure page index out of range: page=\(candidate.pageIndex) region=\(candidate.regionIndex)"
+            )
+        }
+
+        guard let cropped = Self.cropFigure(
+            from: pages[candidate.pageIndex],
+            bbox2D: candidate.bbox2D
+        ) else {
+            return MarkdownBundleFigureOutput(
+                candidateIndex: candidateIndex,
+                figure: nil,
+                warning: "bundle.figure crop failed: page=\(candidate.pageIndex) region=\(candidate.regionIndex)"
+            )
+        }
+
+        guard let encoded = Self.encodeFigure(
+            image: cropped,
+            format: figureFormat,
+            heicCompressionQuality: heicCompressionQuality
+        ) else {
+            return MarkdownBundleFigureOutput(
+                candidateIndex: candidateIndex,
+                figure: nil,
+                warning: "bundle.figure encode failed: page=\(candidate.pageIndex) region=\(candidate.regionIndex)"
+            )
+        }
+
+        let fileName =
+            "page_\(Self.padded(candidate.pageIndex + 1, width: 4))_region_\(Self.padded(candidate.regionIndex, width: 4)).\(figureFormat.fileExtension)"
+        let relativePath = "\(figuresDirectoryName)/\(fileName)"
+        let figure = OCRFigureAsset(
+            pageIndex: candidate.pageIndex,
+            regionIndex: candidate.regionIndex,
+            label: candidate.label,
+            bbox2D: candidate.bbox2D,
+            altText: "",
+            fileName: fileName,
+            relativePath: relativePath,
+            widthPX: cropped.width,
+            heightPX: cropped.height,
+            mimeType: figureFormat.mimeType,
+            sha256: Self.fullSHA256Hex(encoded),
+            data: encoded
+        )
+        return MarkdownBundleFigureOutput(
+            candidateIndex: candidateIndex,
+            figure: figure,
+            warning: nil
+        )
+    }
+
+    private nonisolated static func cropFigure(from page: CGImage, bbox2D: [Int]) -> CGImage? {
+        guard bbox2D.count == 4 else {
+            return nil
+        }
+
+        let width = page.width
+        let height = page.height
+        guard width > 0, height > 0 else {
+            return nil
+        }
+
+        let x1 = Self.clamp(Self.denormalize(value: bbox2D[0], size: width), minimum: 0, maximum: width)
+        let y1 = Self.clamp(Self.denormalize(value: bbox2D[1], size: height), minimum: 0, maximum: height)
+        let x2 = Self.clamp(Self.denormalize(value: bbox2D[2], size: width), minimum: 0, maximum: width)
+        let y2 = Self.clamp(Self.denormalize(value: bbox2D[3], size: height), minimum: 0, maximum: height)
+        guard x1 < x2, y1 < y2 else {
+            return nil
+        }
+
+        let rect = CGRect(
+            x: x1,
+            y: y1,
+            width: x2 - x1,
+            height: y2 - y1
+        )
+        return page.cropping(to: rect)
+    }
+
+    private nonisolated static func encodeFigure(
+        image: CGImage,
+        format: GlmOCRFigureFormat,
+        heicCompressionQuality: Double
+    ) -> Data? {
+        switch format {
+        case .heic:
+            let data = NSMutableData()
+            guard let destination = CGImageDestinationCreateWithData(
+                data,
+                UTType.heic.identifier as CFString,
+                1,
+                nil
+            ) else {
+                return nil
+            }
+
+            let options: [CFString: Any] = [
+                kCGImageDestinationLossyCompressionQuality: heicCompressionQuality
+            ]
+            CGImageDestinationAddImage(destination, image, options as CFDictionary)
+            guard CGImageDestinationFinalize(destination) else {
+                return nil
+            }
+            return data as Data
+        }
+    }
+
+    private func rewriteMarkdownFigureMarkers(
+        markdown: String,
+        figurePathsByCandidate: [String?]
+    ) -> (markdown: String, warnings: [String]) {
+        guard
+            let regex = try? NSRegularExpression(
+                pattern: #"\!\[[^\]]*]\(page\s*=\s*\d+\s*,\s*bbox\s*=\s*\[\d+\s*,\s*\d+\s*,\s*\d+\s*,\s*\d+\]\)"#,
+                options: []
+            )
+        else {
+            return (markdown, ["bundle.figure regex compile failed"])
+        }
+
+        let source = markdown as NSString
+        let fullRange = NSRange(location: 0, length: source.length)
+        let matches = regex.matches(in: markdown, options: [], range: fullRange)
+
+        var warnings: [String] = []
+        if matches.count != figurePathsByCandidate.count {
+            warnings.append(
+                "bundle.figure marker count mismatch: markers=\(matches.count) figures=\(figurePathsByCandidate.count)"
+            )
+        }
+
+        let mutable = NSMutableString(string: markdown)
+        for index in stride(from: matches.count - 1, through: 0, by: -1) {
+            let match = matches[index]
+            guard index < figurePathsByCandidate.count else {
+                continue
+            }
+            guard let relativePath = figurePathsByCandidate[index] else {
+                continue
+            }
+            mutable.replaceCharacters(in: match.range, with: "![](\(relativePath))")
+        }
+
+        return (mutable as String, warnings)
+    }
+
+    private func makeMarkdownBundleDocumentJSON(
+        pages: [OCRPageResult],
+        diagnostics: ParseDiagnostics,
+        figures: [OCRFigureAsset]
+    ) -> String {
+        let sidecar = MarkdownBundleSidecar(
+            schemaVersion: 1,
+            markdownPath: config.markdownBundle.markdownFileName,
+            figuresDirectory: config.markdownBundle.figuresDirectoryName,
+            pages: pages,
+            diagnostics: diagnostics,
+            figures: figures.map {
+                MarkdownBundleFigureRecord(
+                    pageIndex: $0.pageIndex,
+                    regionIndex: $0.regionIndex,
+                    label: $0.label,
+                    bbox2D: $0.bbox2D,
+                    altText: $0.altText,
+                    fileName: $0.fileName,
+                    relativePath: $0.relativePath,
+                    widthPX: $0.widthPX,
+                    heightPX: $0.heightPX,
+                    mimeType: $0.mimeType,
+                    sha256: $0.sha256
+                )
+            }
+        )
+
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        guard let data = try? encoder.encode(sidecar),
+              let json = String(data: data, encoding: .utf8)
+        else {
+            return "{}"
+        }
+
+        return json
+    }
+
+    private func denormalize(value: Int, size: Int) -> Int {
+        Self.denormalize(value: value, size: size)
+    }
+
+    private nonisolated static func denormalize(value: Int, size: Int) -> Int {
+        Int((Double(value) * Double(size)) / 1000.0)
+    }
+
+    private func clamp(_ value: Int, minimum: Int, maximum: Int) -> Int {
+        Self.clamp(value, minimum: minimum, maximum: maximum)
+    }
+
+    private nonisolated static func clamp(_ value: Int, minimum: Int, maximum: Int) -> Int {
+        min(max(value, minimum), maximum)
+    }
+
+    private func padded(_ value: Int, width: Int) -> String {
+        Self.padded(value, width: width)
+    }
+
+    private nonisolated static func padded(_ value: Int, width: Int) -> String {
+        let text = String(value)
+        guard text.count < width else {
+            return text
+        }
+        return String(repeating: "0", count: width - text.count) + text
+    }
+
+    private func fullSHA256Hex(_ data: Data) -> String {
+        Self.fullSHA256Hex(data)
+    }
+
+    private nonisolated static func fullSHA256Hex(_ data: Data) -> String {
+        let digest = SHA256.hash(data: data)
+        let hexDigits = Array("0123456789abcdef")
+        return digest.map { byte in
+            let high = Int(byte / 16)
+            let low = Int(byte % 16)
+            return String([hexDigits[high], hexDigits[low]])
+        }.joined()
+    }
+
     private func elapsedMilliseconds(since start: Date) -> Double {
         Date().timeIntervalSince(start) * 1000.0
     }
@@ -574,7 +1151,7 @@ public actor GlmOCRPipeline {
                 "width": image.width,
                 "height": image.height
             ]
-            if let metadata = cropDebugMetadata(for: image) {
+            if let metadata = Self.cropDebugMetadata(for: image) {
                 payload["rgbSHA256"] = metadata.sha256
             } else {
                 payload["rgbSHA256"] = NSNull()
@@ -597,7 +1174,9 @@ public actor GlmOCRPipeline {
         return String(hex.prefix(max(1, length)))
     }
 
-    private func cropDebugMetadata(for image: CGImage) -> (width: Int, height: Int, channels: Int, sha256: String)? {
+    private nonisolated static func cropDebugMetadata(
+        for image: CGImage
+    ) -> (width: Int, height: Int, channels: Int, sha256: String)? {
         let width = image.width
         let height = image.height
         guard width > 0, height > 0 else {
@@ -676,6 +1255,42 @@ public actor GlmOCRPipeline {
     }
 }
 
+private struct FigureCandidate: Sendable {
+    let pageIndex: Int
+    let regionIndex: Int
+    let label: String
+    let bbox2D: [Int]
+}
+
+private struct MarkdownBundleBuildOutput: Sendable {
+    let rewrittenMarkdown: String
+    let figures: [OCRFigureAsset]
+    let warnings: [String]
+}
+
+private struct MarkdownBundleSidecar: Codable {
+    let schemaVersion: Int
+    let markdownPath: String
+    let figuresDirectory: String
+    let pages: [OCRPageResult]
+    let diagnostics: ParseDiagnostics
+    let figures: [MarkdownBundleFigureRecord]
+}
+
+private struct MarkdownBundleFigureRecord: Codable {
+    let pageIndex: Int
+    let regionIndex: Int
+    let label: String
+    let bbox2D: [Int]
+    let altText: String
+    let fileName: String
+    let relativePath: String
+    let widthPX: Int
+    let heightPX: Int
+    let mimeType: String
+    let sha256: String
+}
+
 private struct OCRPreprocessPageUnit: @unchecked Sendable {
     let pageIndex: Int
     let image: CGImage
@@ -686,8 +1301,38 @@ private struct OCRPreprocessOutput: @unchecked Sendable {
     let pageRegions: [[PipelineRegionRecord]]
     let recognitionJobs: [PipelineRecognitionJob]
     let warnings: [String]
+    let stats: OCRPreprocessStats
 }
 
 private struct OCRInferenceOutput: @unchecked Sendable {
     let results: [PipelineRecognitionJobKey: Result<String, Error>]
+    let stats: OCRInferenceSchedulerStats
+}
+
+private struct OCRPreprocessStats: Sendable {
+    var detectionCount: Int = 0
+    var recognitionJobCount: Int = 0
+    var recognitionTextJobCount: Int = 0
+    var recognitionTableJobCount: Int = 0
+    var recognitionFormulaJobCount: Int = 0
+    var skipRegionCount: Int = 0
+}
+
+private struct OCRPreprocessPageOutput: @unchecked Sendable {
+    let pageIndex: Int
+    var pageRegions: [PipelineRegionRecord] = []
+    var recognitionJobs: [PipelineRecognitionJob] = []
+    var warnings: [String] = []
+    var debugEntries: [[String: Any]] = []
+    var detectionCount: Int = 0
+    var recognitionTextJobCount: Int = 0
+    var recognitionTableJobCount: Int = 0
+    var recognitionFormulaJobCount: Int = 0
+    var skipRegionCount: Int = 0
+}
+
+private struct MarkdownBundleFigureOutput: Sendable {
+    let candidateIndex: Int
+    let figure: OCRFigureAsset?
+    let warning: String?
 }

@@ -315,11 +315,184 @@ public struct GlmOCRLayoutConfig: Sendable, Codable, Equatable {
     }
 }
 
+public enum GlmOCRFigureFormat: String, Sendable, Codable, Equatable {
+    case heic
+
+    internal var fileExtension: String {
+        switch self {
+        case .heic:
+            return "heic"
+        }
+    }
+
+    internal var mimeType: String {
+        switch self {
+        case .heic:
+            return "image/heic"
+        }
+    }
+}
+
+public struct GlmOCRMarkdownBundleConfig: Sendable, Codable, Equatable {
+    public var enabled: Bool
+    public var figureFormat: GlmOCRFigureFormat
+    public var markdownFileName: String
+    public var jsonFileName: String
+    public var figuresDirectoryName: String
+    public var heicCompressionQuality: Double
+
+    public init(
+        enabled: Bool = true,
+        figureFormat: GlmOCRFigureFormat = .heic,
+        markdownFileName: String = "document.md",
+        jsonFileName: String = "document.json",
+        figuresDirectoryName: String = "figures",
+        heicCompressionQuality: Double = 0.82
+    ) {
+        self.enabled = enabled
+        self.figureFormat = figureFormat
+        self.markdownFileName = markdownFileName
+        self.jsonFileName = jsonFileName
+        self.figuresDirectoryName = figuresDirectoryName
+        self.heicCompressionQuality = heicCompressionQuality
+    }
+
+    func validate() throws {
+        try validatePathComponent(markdownFileName, field: "markdownBundle.markdownFileName")
+        try validatePathComponent(jsonFileName, field: "markdownBundle.jsonFileName")
+        try validatePathComponent(figuresDirectoryName, field: "markdownBundle.figuresDirectoryName")
+        guard heicCompressionQuality >= 0, heicCompressionQuality <= 1 else {
+            throw GlmOCRError.invalidConfiguration(
+                "markdownBundle.heicCompressionQuality must be between 0 and 1"
+            )
+        }
+    }
+
+    private static let invalidPathCharacters = CharacterSet(charactersIn: "/\\")
+
+    private func validatePathComponent(_ value: String, field: String) throws {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            throw GlmOCRError.invalidConfiguration("\(field) must not be empty")
+        }
+        guard trimmed.rangeOfCharacter(from: Self.invalidPathCharacters) == nil else {
+            throw GlmOCRError.invalidConfiguration("\(field) must not contain path separators")
+        }
+        guard trimmed != "." && trimmed != ".." else {
+            throw GlmOCRError.invalidConfiguration("\(field) must be a regular file/directory name")
+        }
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case enabled
+        case figureFormat
+        case markdownFileName
+        case jsonFileName
+        case figuresDirectoryName
+        case heicCompressionQuality
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let defaults = Self()
+        self.enabled = try container.decodeIfPresent(Bool.self, forKey: .enabled) ?? defaults.enabled
+        self.figureFormat = try container.decodeIfPresent(GlmOCRFigureFormat.self, forKey: .figureFormat)
+            ?? defaults.figureFormat
+        self.markdownFileName = try container.decodeIfPresent(String.self, forKey: .markdownFileName)
+            ?? defaults.markdownFileName
+        self.jsonFileName = try container.decodeIfPresent(String.self, forKey: .jsonFileName) ?? defaults.jsonFileName
+        self.figuresDirectoryName = try container.decodeIfPresent(String.self, forKey: .figuresDirectoryName)
+            ?? defaults.figuresDirectoryName
+        self.heicCompressionQuality = try container.decodeIfPresent(Double.self, forKey: .heicCompressionQuality)
+            ?? defaults.heicCompressionQuality
+    }
+}
+
+public struct GlmOCRPerformanceConfig: Sendable, Codable, Equatable {
+    public var inferenceBatchSize: Int
+    public var inferenceBatchMaxWaitMs: Int
+    public var inferenceMaxInflightJobs: Int
+    public var pdfRenderConcurrency: Int
+    public var ocrPreprocessConcurrency: Int
+    public var bundleEncodeConcurrency: Int
+    public var layoutPostprocessFastPath: Bool
+
+    public init(
+        inferenceBatchSize: Int = 4,
+        inferenceBatchMaxWaitMs: Int = 8,
+        inferenceMaxInflightJobs: Int = 64,
+        pdfRenderConcurrency: Int = 2,
+        ocrPreprocessConcurrency: Int = 4,
+        bundleEncodeConcurrency: Int = 2,
+        layoutPostprocessFastPath: Bool = true
+    ) {
+        self.inferenceBatchSize = inferenceBatchSize
+        self.inferenceBatchMaxWaitMs = inferenceBatchMaxWaitMs
+        self.inferenceMaxInflightJobs = inferenceMaxInflightJobs
+        self.pdfRenderConcurrency = pdfRenderConcurrency
+        self.ocrPreprocessConcurrency = ocrPreprocessConcurrency
+        self.bundleEncodeConcurrency = bundleEncodeConcurrency
+        self.layoutPostprocessFastPath = layoutPostprocessFastPath
+    }
+
+    func validate() throws {
+        guard inferenceBatchSize > 0 else {
+            throw GlmOCRError.invalidConfiguration("performance.inferenceBatchSize must be greater than zero")
+        }
+        guard inferenceBatchMaxWaitMs >= 0 else {
+            throw GlmOCRError.invalidConfiguration("performance.inferenceBatchMaxWaitMs must be >= 0")
+        }
+        guard inferenceMaxInflightJobs > 0 else {
+            throw GlmOCRError.invalidConfiguration("performance.inferenceMaxInflightJobs must be greater than zero")
+        }
+        guard pdfRenderConcurrency > 0 else {
+            throw GlmOCRError.invalidConfiguration("performance.pdfRenderConcurrency must be greater than zero")
+        }
+        guard ocrPreprocessConcurrency > 0 else {
+            throw GlmOCRError.invalidConfiguration("performance.ocrPreprocessConcurrency must be greater than zero")
+        }
+        guard bundleEncodeConcurrency > 0 else {
+            throw GlmOCRError.invalidConfiguration("performance.bundleEncodeConcurrency must be greater than zero")
+        }
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case inferenceBatchSize
+        case inferenceBatchMaxWaitMs
+        case inferenceMaxInflightJobs
+        case pdfRenderConcurrency
+        case ocrPreprocessConcurrency
+        case bundleEncodeConcurrency
+        case layoutPostprocessFastPath
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let defaults = Self()
+        self.inferenceBatchSize = try container.decodeIfPresent(Int.self, forKey: .inferenceBatchSize)
+            ?? defaults.inferenceBatchSize
+        self.inferenceBatchMaxWaitMs = try container.decodeIfPresent(Int.self, forKey: .inferenceBatchMaxWaitMs)
+            ?? defaults.inferenceBatchMaxWaitMs
+        self.inferenceMaxInflightJobs = try container.decodeIfPresent(Int.self, forKey: .inferenceMaxInflightJobs)
+            ?? defaults.inferenceMaxInflightJobs
+        self.pdfRenderConcurrency = try container.decodeIfPresent(Int.self, forKey: .pdfRenderConcurrency)
+            ?? defaults.pdfRenderConcurrency
+        self.ocrPreprocessConcurrency = try container.decodeIfPresent(Int.self, forKey: .ocrPreprocessConcurrency)
+            ?? defaults.ocrPreprocessConcurrency
+        self.bundleEncodeConcurrency = try container.decodeIfPresent(Int.self, forKey: .bundleEncodeConcurrency)
+            ?? defaults.bundleEncodeConcurrency
+        self.layoutPostprocessFastPath = try container.decodeIfPresent(Bool.self, forKey: .layoutPostprocessFastPath)
+            ?? defaults.layoutPostprocessFastPath
+    }
+}
+
 public struct GlmOCRConfig: Sendable, Codable, Equatable {
     public var recognizerModelID: String
     public var layoutModelID: String
     public var maxConcurrentRecognitions: Int
     public var enableLayout: Bool
+    public var performance: GlmOCRPerformanceConfig
+    public var markdownBundle: GlmOCRMarkdownBundleConfig
     public var recognitionOptions: GlmOCRRecognitionOptions
     public var prompts: GlmOCRPromptConfig
     public var layout: GlmOCRLayoutConfig
@@ -335,6 +508,8 @@ public struct GlmOCRConfig: Sendable, Codable, Equatable {
         layoutModelID: String = "PaddlePaddle/PP-DocLayoutV3_safetensors",
         maxConcurrentRecognitions: Int = 1,
         enableLayout: Bool = true,
+        performance: GlmOCRPerformanceConfig = .init(),
+        markdownBundle: GlmOCRMarkdownBundleConfig = .init(),
         recognitionOptions: GlmOCRRecognitionOptions = .init(),
         prompts: GlmOCRPromptConfig = .init(),
         layout: GlmOCRLayoutConfig = .init(),
@@ -346,6 +521,8 @@ public struct GlmOCRConfig: Sendable, Codable, Equatable {
         self.layoutModelID = layoutModelID
         self.maxConcurrentRecognitions = maxConcurrentRecognitions
         self.enableLayout = enableLayout
+        self.performance = performance
+        self.markdownBundle = markdownBundle
         self.recognitionOptions = recognitionOptions
         self.prompts = prompts
         self.layout = layout
@@ -377,9 +554,11 @@ public struct GlmOCRConfig: Sendable, Codable, Equatable {
             throw GlmOCRError.invalidConfiguration("defaultMaxPages must be greater than zero when provided")
         }
 
+        try performance.validate()
         try recognitionOptions.validate()
         try prompts.validate()
         try layout.validate()
+        try markdownBundle.validate()
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -387,6 +566,8 @@ public struct GlmOCRConfig: Sendable, Codable, Equatable {
         case layoutModelID
         case maxConcurrentRecognitions
         case enableLayout
+        case performance
+        case markdownBundle
         case recognitionOptions
         case prompts
         case layout
@@ -406,6 +587,10 @@ public struct GlmOCRConfig: Sendable, Codable, Equatable {
         self.maxConcurrentRecognitions = try container.decodeIfPresent(Int.self, forKey: .maxConcurrentRecognitions)
             ?? defaults.maxConcurrentRecognitions
         self.enableLayout = try container.decodeIfPresent(Bool.self, forKey: .enableLayout) ?? defaults.enableLayout
+        self.performance = try container.decodeIfPresent(GlmOCRPerformanceConfig.self, forKey: .performance)
+            ?? defaults.performance
+        self.markdownBundle = try container.decodeIfPresent(GlmOCRMarkdownBundleConfig.self, forKey: .markdownBundle)
+            ?? defaults.markdownBundle
         self.recognitionOptions = try container.decodeIfPresent(GlmOCRRecognitionOptions.self, forKey: .recognitionOptions)
             ?? defaults.recognitionOptions
         self.prompts = try container.decodeIfPresent(GlmOCRPromptConfig.self, forKey: .prompts) ?? defaults.prompts
@@ -414,6 +599,22 @@ public struct GlmOCRConfig: Sendable, Codable, Equatable {
         self.pdfMaxRenderedLongSide = try container.decodeIfPresent(Double.self, forKey: .pdfMaxRenderedLongSide)
             ?? defaults.pdfMaxRenderedLongSide
         self.defaultMaxPages = try container.decodeIfPresent(Int.self, forKey: .defaultMaxPages)
+    }
+}
+
+internal extension GlmOCRConfig {
+    private static let legacyMaxConcurrentRecognitionsDefault = 1
+
+    var effectivePerformanceConfig: GlmOCRPerformanceConfig {
+        var resolved = performance
+        let performanceIsDefault = performance == GlmOCRPerformanceConfig()
+        let legacyConcurrencyOverridden = maxConcurrentRecognitions != Self.legacyMaxConcurrentRecognitionsDefault
+
+        if performanceIsDefault || legacyConcurrencyOverridden {
+            resolved.inferenceMaxInflightJobs = maxConcurrentRecognitions
+        }
+
+        return resolved
     }
 }
 
@@ -518,15 +719,90 @@ public struct ParseDiagnostics: Sendable, Codable, Equatable {
     }
 }
 
+public struct OCRFigureAsset: Sendable, Codable, Equatable {
+    public let pageIndex: Int
+    public let regionIndex: Int
+    public let label: String
+    public let bbox2D: [Int]
+    public let altText: String
+    public let fileName: String
+    public let relativePath: String
+    public let widthPX: Int
+    public let heightPX: Int
+    public let mimeType: String
+    public let sha256: String
+    public let data: Data
+
+    public init(
+        pageIndex: Int,
+        regionIndex: Int,
+        label: String,
+        bbox2D: [Int],
+        altText: String,
+        fileName: String,
+        relativePath: String,
+        widthPX: Int,
+        heightPX: Int,
+        mimeType: String,
+        sha256: String,
+        data: Data
+    ) {
+        self.pageIndex = pageIndex
+        self.regionIndex = regionIndex
+        self.label = label
+        self.bbox2D = bbox2D
+        self.altText = altText
+        self.fileName = fileName
+        self.relativePath = relativePath
+        self.widthPX = widthPX
+        self.heightPX = heightPX
+        self.mimeType = mimeType
+        self.sha256 = sha256
+        self.data = data
+    }
+}
+
+public struct OCRMarkdownBundle: Sendable, Codable, Equatable {
+    public let rewrittenMarkdown: String
+    public let documentJSON: String
+    public let markdownFileName: String
+    public let jsonFileName: String
+    public let figuresDirectoryName: String
+    public let figures: [OCRFigureAsset]
+
+    public init(
+        rewrittenMarkdown: String,
+        documentJSON: String,
+        markdownFileName: String,
+        jsonFileName: String,
+        figuresDirectoryName: String,
+        figures: [OCRFigureAsset]
+    ) {
+        self.rewrittenMarkdown = rewrittenMarkdown
+        self.documentJSON = documentJSON
+        self.markdownFileName = markdownFileName
+        self.jsonFileName = jsonFileName
+        self.figuresDirectoryName = figuresDirectoryName
+        self.figures = figures
+    }
+}
+
 public struct OCRDocumentResult: Sendable, Codable, Equatable {
     public let pages: [OCRPageResult]
     public let markdown: String
     public let diagnostics: ParseDiagnostics
+    public let markdownBundle: OCRMarkdownBundle?
 
-    public init(pages: [OCRPageResult], markdown: String, diagnostics: ParseDiagnostics) {
+    public init(
+        pages: [OCRPageResult],
+        markdown: String,
+        diagnostics: ParseDiagnostics,
+        markdownBundle: OCRMarkdownBundle? = nil
+    ) {
         self.pages = pages
         self.markdown = markdown
         self.diagnostics = diagnostics
+        self.markdownBundle = markdownBundle
     }
 }
 
