@@ -10,7 +10,7 @@ This article describes the Swift port architecture and runtime flow.
 - `GlmOCRLayoutMLX`: PP-DocLayoutV3 inference, preprocessing, and postprocessing
 - `GlmOCRRecognizerMLX`: GLM-OCR recognizer runtime, tokenizer/config/model loading, generation
 - `GlmOCRModelDelivery`: model resolution, download, cache verification, persisted model state
-- `GlmOCRPDFium` (macOS): PDFium-backed rasterization
+- `GlmOCRPDFium` (iOS/macOS): PDFium-backed rasterization
 - `CPDFium` / `PDFiumBinary`: PDFium bridge and binary
 
 ## End-to-end flow
@@ -31,8 +31,8 @@ This article describes the Swift port architecture and runtime flow.
 - `.image`: pass-through single page
 - `.imageData`: `CGImageSource` decode
 - `.pdfData`:
-  - macOS: PDFium (`PDFiumDocument` + `PDFiumPageRasterizer`)
-  - iOS: CoreGraphics PDF rendering fallback
+  - iOS/macOS: PDFium (`PDFiumDocument` + `PDFiumPageRasterizer`) when the PDFium module is available at build time
+  - fallback: CoreGraphics PDF rendering when PDFium is not linked into the build
 
 Page limits:
 

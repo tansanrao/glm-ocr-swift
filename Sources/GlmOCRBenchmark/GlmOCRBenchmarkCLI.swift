@@ -1,7 +1,22 @@
 import Foundation
 
+#if os(macOS)
 import GlmOCRSwift
+#endif
 
+@main
+struct GlmOCRBenchmarkCLI {
+    static func main() async {
+        #if os(macOS)
+        await runOnMacOS()
+        #else
+        fputs("GlmOCRBenchmark is only supported on macOS.\n", stderr)
+        exit(1)
+        #endif
+    }
+}
+
+#if os(macOS)
 private struct BenchmarkOutput: Codable {
     let timestampUTC: String
     let pdfPath: String
@@ -14,9 +29,8 @@ private struct BenchmarkOutput: Codable {
     let ocrInferenceJobsPerSecond: Double?
 }
 
-@main
-struct GlmOCRBenchmarkCLI {
-    static func main() async {
+private extension GlmOCRBenchmarkCLI {
+    static func runOnMacOS() async {
         do {
             let cli = try parseArguments(CommandLine.arguments)
             let pdfData = try Data(contentsOf: URL(fileURLWithPath: cli.pdfPath))
@@ -80,8 +94,40 @@ struct GlmOCRBenchmarkCLI {
             exit(1)
         }
     }
+}
+#endif
 
-    private static func parseArguments(_ args: [String]) throws -> CLIArguments {
+private struct CLIArguments {
+    let pdfPath: String
+    let maxPages: Int?
+    let disableLayout: Bool
+    let maxConcurrentRecognitions: Int?
+    let inferenceBatchSize: Int?
+    let inferenceMaxInflightJobs: Int?
+}
+
+private enum CLIError: Error, CustomStringConvertible {
+    case unknownArgument(String)
+    case missingValue(String)
+    case invalidValue(arg: String, value: String)
+    case invalidUTF8Encoding
+
+    var description: String {
+        switch self {
+        case .unknownArgument(let arg):
+            return "Unknown argument: \(arg)"
+        case .missingValue(let arg):
+            return "Missing value for argument: \(arg)"
+        case .invalidValue(let arg, let value):
+            return "Invalid value for \(arg): \(value)"
+        case .invalidUTF8Encoding:
+            return "Failed to encode benchmark output as UTF-8"
+        }
+    }
+}
+
+private extension GlmOCRBenchmarkCLI {
+    static func parseArguments(_ args: [String]) throws -> CLIArguments {
         var pdfPath = "/Users/tansanrao/work/glm-ocr-swift/test-arxiv-paper.pdf"
         var maxPages: Int?
         var disableLayout = false
@@ -137,7 +183,7 @@ struct GlmOCRBenchmarkCLI {
         )
     }
 
-    private static func printUsageAndExit() -> Never {
+    static func printUsageAndExit() -> Never {
         let usage = """
         Usage: swift run GlmOCRBenchmark [options]
           --pdf <path>             PDF input path (default: /Users/tansanrao/work/glm-ocr-swift/test-arxiv-paper.pdf)
@@ -149,34 +195,5 @@ struct GlmOCRBenchmarkCLI {
         """
         print(usage)
         exit(0)
-    }
-}
-
-private struct CLIArguments {
-    let pdfPath: String
-    let maxPages: Int?
-    let disableLayout: Bool
-    let maxConcurrentRecognitions: Int?
-    let inferenceBatchSize: Int?
-    let inferenceMaxInflightJobs: Int?
-}
-
-private enum CLIError: Error, CustomStringConvertible {
-    case unknownArgument(String)
-    case missingValue(String)
-    case invalidValue(arg: String, value: String)
-    case invalidUTF8Encoding
-
-    var description: String {
-        switch self {
-        case .unknownArgument(let arg):
-            return "Unknown argument: \(arg)"
-        case .missingValue(let arg):
-            return "Missing value for argument: \(arg)"
-        case .invalidValue(let arg, let value):
-            return "Invalid value for \(arg): \(value)"
-        case .invalidUTF8Encoding:
-            return "Failed to encode benchmark output as UTF-8"
-        }
     }
 }

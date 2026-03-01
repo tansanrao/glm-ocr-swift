@@ -1,4 +1,4 @@
-// swift-tools-version: 6.0
+// swift-tools-version: 6.2
 import PackageDescription
 
 let strictConcurrency: [SwiftSetting] = [
@@ -8,8 +8,8 @@ let strictConcurrency: [SwiftSetting] = [
 let package = Package(
     name: "GlmOCRSwift",
     platforms: [
-        .iOS(.v17),
-        .macOS(.v14)
+        .iOS(.v26),
+        .macOS(.v26)
     ],
     products: [
         .library(
@@ -44,7 +44,7 @@ let package = Package(
                 "GlmOCRModelDelivery",
                 "GlmOCRFormatting",
                 "GlmOCRRecognizerMLX",
-                .target(name: "GlmOCRPDFium", condition: .when(platforms: [.macOS]))
+                .target(name: "GlmOCRPDFium", condition: .when(platforms: [.iOS, .macOS]))
             ],
             swiftSettings: strictConcurrency
         ),
@@ -87,7 +87,7 @@ let package = Package(
             name: "GlmOCRPDFium",
             dependencies: [
                 "CPDFium",
-                .target(name: "PDFiumBinary", condition: .when(platforms: [.macOS]))
+                .target(name: "PDFiumBinary", condition: .when(platforms: [.iOS, .macOS]))
             ],
             swiftSettings: strictConcurrency
         ),
@@ -103,7 +103,8 @@ let package = Package(
             name: "GlmOCRTests",
             dependencies: [
                 "GlmOCRSwift",
-                "GlmOCRRecognizerMLX"
+                "GlmOCRRecognizerMLX",
+                "GlmOCRPDFium"
             ],
             swiftSettings: strictConcurrency
         ),

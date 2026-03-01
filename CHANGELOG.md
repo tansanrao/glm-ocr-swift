@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Added iOS PDFium support via vendored multi-platform `PDFium.xcframework` slices (`ios-arm64`, `ios-arm64-simulator`, `macos-arm64`).
+- Updated PDF page rendering selection to use `GlmOCRPDFium` whenever it is linked into the build.
+- Added `PDFiumSmokeTests` covering in-memory PDF creation + PDFium page rasterization.
+- Updated package platform minimums to iOS 26+ and macOS 26+.
+- Added non-macOS benchmark CLI entrypoint guard so package iOS build/test actions compile cleanly.
+
 ## 0.2.0
 
 - Added markdown bundle export config (`GlmOCRMarkdownBundleConfig`) enabled by default.

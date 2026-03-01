@@ -13,7 +13,7 @@ The package includes a full pipeline:
 ## Requirements
 
 - Swift 6
-- iOS 17+ or macOS 14+
+- iOS 26+ or macOS 26+
 
 ## Installation
 
@@ -78,6 +78,10 @@ PDF page limits are resolved as:
 - if both `ParseOptions.maxPages` and `GlmOCRConfig.defaultMaxPages` are set, effective cap is `min(a, b)`
 - if one is set, that value is used
 - if neither is set, all pages are processed
+
+PDF rendering backend:
+
+- iOS and macOS: PDFium-backed rendering (`GlmOCRPDFium`) when available in the package build.
 
 ## Configuration defaults
 

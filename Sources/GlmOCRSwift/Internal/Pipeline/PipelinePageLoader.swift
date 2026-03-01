@@ -2,7 +2,7 @@ import CoreGraphics
 import ImageIO
 import Dispatch
 import Foundation
-#if os(macOS)
+#if canImport(GlmOCRPDFium)
 import GlmOCRPDFium
 #endif
 
@@ -98,7 +98,7 @@ internal struct PipelinePageLoader: PipelinePageLoading {
         _ data: Data,
         maxPages: Int?
     ) throws -> [CGImage] {
-#if os(macOS)
+#if canImport(GlmOCRPDFium)
         let document: PDFiumDocument
         do {
             document = try PDFiumDocument(data: data)
@@ -243,7 +243,7 @@ internal struct PipelinePageLoader: PipelinePageLoading {
         return requestedPageCount
     }
 
-#if os(macOS)
+#if canImport(GlmOCRPDFium)
     private func renderSequentialPDFiumPages(
         document: PDFiumDocument,
         requestedPageCount: Int
@@ -333,7 +333,7 @@ internal struct PipelinePageLoader: PipelinePageLoading {
     }
 #endif
 
-#if !os(macOS)
+#if !canImport(GlmOCRPDFium)
     private func renderSequentialCGPDFPages(
         document: CGPDFDocument,
         requestedPageCount: Int
